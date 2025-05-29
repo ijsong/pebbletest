@@ -46,6 +46,7 @@ var (
 	enableValueBlocks                   bool
 	enableMultiLevelCompactionHeuristic bool
 
+	verbose            bool
 	metricsLogInterval time.Duration
 	otelAddr           string
 )
@@ -69,6 +70,7 @@ func init() {
 	flag.BoolVar(&enableValueBlocks, "enable-value-blocks", false, "Enable value blocks (default: false)")
 	flag.BoolVar(&enableMultiLevelCompactionHeuristic, "enable-multi-level-compaction-heuristic", false, "Enable multi-level compaction heuristic (default: false)")
 
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 	flag.DurationVar(&metricsLogInterval, "metrics-log-interval", 3*time.Second, "Interval for logging database metrics (default: 3s)")
 	flag.StringVar(&otelAddr, "otel-addr", os.Getenv("OTEL_ADDR"), "OpenTelemetry collector address (optional)")
 
@@ -252,6 +254,22 @@ func main() {
 	}
 
 	opts.EnsureDefaults()
+
+	if verbose {
+		el := pebble.MakeLoggingEventListener(&logAdaptor{})
+		opts.EventListener = &el
+		opts.EventListener.FlushBegin = nil
+		opts.EventListener.FlushEnd = nil
+		opts.EventListener.ManifestCreated = nil
+		opts.EventListener.ManifestDeleted = nil
+		opts.EventListener.TableCreated = nil
+		opts.EventListener.TableDeleted = nil
+		opts.EventListener.TableIngested = nil
+		opts.EventListener.TableStatsLoaded = nil
+		opts.EventListener.TableValidated = nil
+		opts.EventListener.WALCreated = nil
+		opts.EventListener.WALDeleted = nil
+	}
 
 	db, err := pebble.Open(dbDir, opts)
 	if err != nil {
@@ -451,4 +469,21 @@ func startMetricsLogger(db *pebble.DB, stopc <-chan struct{}) {
 			return
 		}
 	}
+}
+
+type logAdaptor struct{}
+
+var _ pebble.Logger = (*logAdaptor)(nil)
+
+func (*logAdaptor) Infof(format string, args ...any) {
+	slog.Info(fmt.Sprintf(format, args...))
+}
+
+func (*logAdaptor) Errorf(format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+}
+
+func (*logAdaptor) Fatalf(format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+	os.Exit(1)
 }
