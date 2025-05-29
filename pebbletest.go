@@ -276,70 +276,55 @@ func main() {
 		wg.Wait()
 	}()
 
-	var (
-		batch          *pebble.Batch
-		count          uint
-		batchStartTime time.Time
-	)
-
 	writeOpts := pebble.NoSync
 	if useSync {
 		writeOpts = pebble.Sync
 	}
 
-	key := make([]byte, 8)
-	value := make([]byte, valueSize)
 	rng := rand.NewChaCha8([32]byte{
 		0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
 		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
 	})
-	_, _ = rng.Read(value)
+
+	key := make([]byte, 8)
+	value := make([]byte, valueSize)
 
 	var seqNum uint64
 	startTime := time.Now()
-	for {
-		if batch == nil {
-			batch = db.NewBatch()
-			batchStartTime = time.Now()
-		}
-		seqNum++
-		binary.BigEndian.PutUint64(key, seqNum)
+	for time.Since(startTime) < testDuration {
+		batchStartTime := time.Now()
+		batch := db.NewBatch()
 
-		if err := batch.Set(key, value, writeOpts); err != nil {
-			slog.Error("failed to set key-value pair", slog.Uint64("key", seqNum), slog.String("err", err.Error()))
+		for range batchLength {
+			seqNum++
+			binary.BigEndian.PutUint64(key, seqNum)
+			_, _ = rng.Read(value)
+			if err := batch.Set(key, value, writeOpts); err != nil {
+				slog.Error("failed to set key-value pair", slog.Uint64("key", seqNum), slog.String("err", err.Error()))
+				os.Exit(1)
+			}
+		}
+
+		if err := batch.Commit(writeOpts); err != nil {
+			slog.Error("failed to commit batch", slog.String("err", err.Error()))
 			os.Exit(1)
 		}
-		count++
 
-		if count == batchLength || time.Since(startTime) > testDuration {
-			if err := batch.Commit(writeOpts); err != nil {
-				slog.Error("failed to commit batch", slog.String("err", err.Error()))
-				os.Exit(1)
-			}
+		stats := batch.CommitStats()
+		batchCommitTotalDuration.Record(context.Background(), stats.TotalDuration.Nanoseconds())
+		batchCommitSemaphoreWaitDuration.Record(context.Background(), stats.SemaphoreWaitDuration.Nanoseconds())
+		batchCommitWALQueueWaitDuration.Record(context.Background(), stats.WALQueueWaitDuration.Nanoseconds())
+		batchCommitMemTableWriteStallDuration.Record(context.Background(), stats.MemTableWriteStallDuration.Nanoseconds())
+		batchCommitL0ReadAmpWriteStallDuration.Record(context.Background(), stats.L0ReadAmpWriteStallDuration.Nanoseconds())
+		batchCommitWALRotationDuration.Record(context.Background(), stats.WALRotationDuration.Nanoseconds())
+		batchCommitCommitWaitDuration.Record(context.Background(), stats.CommitWaitDuration.Nanoseconds())
 
-			stats := batch.CommitStats()
-			batchCommitTotalDuration.Record(context.Background(), stats.TotalDuration.Nanoseconds())
-			batchCommitSemaphoreWaitDuration.Record(context.Background(), stats.SemaphoreWaitDuration.Nanoseconds())
-			batchCommitWALQueueWaitDuration.Record(context.Background(), stats.WALQueueWaitDuration.Nanoseconds())
-			batchCommitMemTableWriteStallDuration.Record(context.Background(), stats.MemTableWriteStallDuration.Nanoseconds())
-			batchCommitL0ReadAmpWriteStallDuration.Record(context.Background(), stats.L0ReadAmpWriteStallDuration.Nanoseconds())
-			batchCommitWALRotationDuration.Record(context.Background(), stats.WALRotationDuration.Nanoseconds())
-			batchCommitCommitWaitDuration.Record(context.Background(), stats.CommitWaitDuration.Nanoseconds())
-
-			if err := batch.Close(); err != nil {
-				slog.Error("failed to close batch", slog.String("err", err.Error()))
-				os.Exit(1)
-			}
-			writeDuration.Record(context.Background(), time.Since(batchStartTime).Nanoseconds())
-			writeSize.Add(context.Background(), int64(valueSize)*int64(count))
-
-			batch = nil
-			count = 0
-
-			if time.Since(startTime) > testDuration {
-				break
-			}
+		if err := batch.Close(); err != nil {
+			slog.Error("failed to close batch", slog.String("err", err.Error()))
+			os.Exit(1)
 		}
+		writeDuration.Record(context.Background(), time.Since(batchStartTime).Nanoseconds())
+		writeSize.Add(context.Background(), int64(valueSize)*int64(batchLength))
 	}
 }
 
