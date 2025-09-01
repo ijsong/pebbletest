@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-	"github.com/cockroachdb/pebble/v2/bloom"
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -199,7 +199,9 @@ func main() {
 		MaxOpenFiles:                16384,
 		MemTableSize:                memTableSize,
 		MemTableStopWritesThreshold: memTableStopWritesThreshold,
-		MaxConcurrentCompactions:    func() int { return maxConcurrentCompactions },
+		CompactionConcurrencyRange: func() (lower int, upper int) {
+			return 1, maxConcurrentCompactions
+		},
 	}
 
 	// from cockroachdb
