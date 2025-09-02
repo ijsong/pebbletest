@@ -5,12 +5,10 @@
 package base
 
 import (
-	"context"
 	"fmt"
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/humanize"
-	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/redact"
 )
 
@@ -103,7 +101,7 @@ type InternalIterator interface {
 	// is pointing at a valid entry, and (nil, nilv) otherwise. Note that SeekGE
 	// only checks the upper bound. It is up to the caller to ensure that key
 	// is greater than or equal to the lower bound.
-	SeekGE(key []byte, flags SeekGEFlags) *InternalKV
+	SeekGE(key []byte, flags SeekGEFlags) (*InternalKey, LazyValue)
 
 	// SeekPrefixGE moves the iterator to the first key/value pair whose key is
 	// greater than or equal to the given key. Returns the key and value if the
@@ -111,15 +109,13 @@ type InternalIterator interface {
 	// SeekPrefixGE only checks the upper bound. It is up to the caller to ensure
 	// that key is greater than or equal to the lower bound.
 	//
-	// The prefix argument is used by some InternalIterator implementations
-	// (e.g.  sstable.Reader) to avoid expensive operations. This operation is
-	// only useful when a user-defined Split function is supplied to the
-	// Comparer for the DB. The supplied prefix will be the prefix of the given
-	// key returned by that Split function. If the iterator is able to determine
-	// that no key with the prefix exists, it can return (nil,nilv). Unlike
-	// SeekGE, this is not an indication that iteration is exhausted. The prefix
-	// byte slice is guaranteed to be stable until the next absolute positioning
-	// operation.
+	// The prefix argument is used by some InternalIterator implementations (e.g.
+	// sstable.Reader) to avoid expensive operations. A user-defined Split
+	// function must be supplied to the Comparer for the DB. The supplied prefix
+	// will be the prefix of the given key returned by that Split function. If
+	// the iterator is able to determine that no key with the prefix exists, it
+	// can return (nil,nilv). Unlike SeekGE, this is not an indication that
+	// iteration is exhausted.
 	//
 	// Note that the iterator may return keys not matching the prefix. It is up
 	// to the caller to check if the prefix matches.
@@ -130,28 +126,28 @@ type InternalIterator interface {
 	// not supporting reverse iteration in prefix iteration mode until a
 	// different positioning routine (SeekGE, SeekLT, First or Last) switches the
 	// iterator out of prefix iteration.
-	SeekPrefixGE(prefix, key []byte, flags SeekGEFlags) *InternalKV
+	SeekPrefixGE(prefix, key []byte, flags SeekGEFlags) (*InternalKey, LazyValue)
 
 	// SeekLT moves the iterator to the last key/value pair whose key is less
 	// than the given key. Returns the key and value if the iterator is pointing
 	// at a valid entry, and (nil, nilv) otherwise. Note that SeekLT only checks
 	// the lower bound. It is up to the caller to ensure that key is less than
 	// the upper bound.
-	SeekLT(key []byte, flags SeekLTFlags) *InternalKV
+	SeekLT(key []byte, flags SeekLTFlags) (*InternalKey, LazyValue)
 
-	// First moves the iterator the first key/value pair. Returns the key and
+	// First moves the iterator the the first key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that First only checks the upper bound. It is up to the
 	// caller to ensure that First() is not called when there is a lower bound,
 	// and instead call SeekGE(lower).
-	First() *InternalKV
+	First() (*InternalKey, LazyValue)
 
-	// Last moves the iterator the last key/value pair. Returns the key and
+	// Last moves the iterator the the last key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nilv)
 	// otherwise. Note that Last only checks the lower bound. It is up to the
 	// caller to ensure that Last() is not called when there is an upper bound,
 	// and instead call SeekLT(upper).
-	Last() *InternalKV
+	Last() (*InternalKey, LazyValue)
 
 	// Next moves the iterator to the next key/value pair. Returns the key and
 	// value if the iterator is pointing at a valid entry, and (nil, nilv)
@@ -162,7 +158,7 @@ type InternalIterator interface {
 	// key/value pair due to either a prior call to SeekLT or Prev which returned
 	// (nil, nilv). It is not allowed to call Next when the previous call to SeekGE,
 	// SeekPrefixGE or Next returned (nil, nilv).
-	Next() *InternalKV
+	Next() (*InternalKey, LazyValue)
 
 	// NextPrefix moves the iterator to the next key/value pair with a different
 	// prefix than the key at the current iterator position. Returns the key and
@@ -178,7 +174,7 @@ type InternalIterator interface {
 	// positioning operation or a call to a forward positioning method that
 	// returned (nil, nilv). It is also not allowed to call NextPrefix when the
 	// iterator is in prefix iteration mode.
-	NextPrefix(succKey []byte) *InternalKV
+	NextPrefix(succKey []byte) (*InternalKey, LazyValue)
 
 	// Prev moves the iterator to the previous key/value pair. Returns the key
 	// and value if the iterator is pointing at a valid entry, and (nil, nilv)
@@ -189,7 +185,7 @@ type InternalIterator interface {
 	// key/value pair due to either a prior call to SeekGE or Next which returned
 	// (nil, nilv). It is not allowed to call Prev when the previous call to SeekLT
 	// or Prev returned (nil, nilv).
-	Prev() *InternalKV
+	Prev() (*InternalKey, LazyValue)
 
 	// Error returns any accumulated error. It may not include errors returned
 	// to the client when calling LazyValue.Value().
@@ -197,10 +193,8 @@ type InternalIterator interface {
 
 	// Close closes the iterator and returns any accumulated error. Exhausting
 	// all the key/value pairs in a table is not considered to be an error.
-	//
-	// Once Close is called, the iterator should not be used again. Specific
-	// implementations may support multiple calls to Close (but no other calls
-	// after the first Close).
+	// It is valid to call Close multiple times. Other methods should not be
+	// called after the iterator has been closed.
 	Close() error
 
 	// SetBounds sets the lower and upper bounds for the iterator. Note that the
@@ -213,23 +207,7 @@ type InternalIterator interface {
 	// optimizations.
 	SetBounds(lower, upper []byte)
 
-	// SetContext replaces the context provided at iterator creation, or the
-	// last one provided by SetContext.
-	SetContext(ctx context.Context)
-
 	fmt.Stringer
-
-	IteratorDebug
-}
-
-// TopLevelIterator extends InternalIterator to include an additional absolute
-// positioning method, SeekPrefixGEStrict.
-type TopLevelIterator interface {
-	InternalIterator
-
-	// SeekPrefixGEStrict extends InternalIterator.SeekPrefixGE with a guarantee
-	// that the iterator only returns keys matching the prefix.
-	SeekPrefixGEStrict(prefix, key []byte, flags SeekGEFlags) *InternalKV
 }
 
 // SeekGEFlags holds flags that may configure the behavior of a forward seek.
@@ -416,9 +394,6 @@ type InternalIteratorStats struct {
 		// ValueBytesFetched is the total byte length of the values (in value
 		// blocks) that were retrieved.
 		ValueBytesFetched uint64
-
-		// TODO(jackson): Add stats for distinguishing between value-block
-		// values and blob values.
 	}
 }
 
@@ -466,20 +441,4 @@ func (s *InternalIteratorStats) SafeFormat(p redact.SafePrinter, verb rune) {
 			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytes),
 			humanize.Bytes.Uint64(s.SeparatedPointValue.ValueBytesFetched))
 	}
-}
-
-// IteratorDebug is an interface implemented by all internal iterators and
-// fragment iterators.
-type IteratorDebug interface {
-	// DebugTree prints the entire iterator stack, used for debugging.
-	//
-	// Each implementation should perform a single Child/Childf call on tp.
-	DebugTree(tp treeprinter.Node)
-}
-
-// DebugTree returns the iterator tree as a multi-line string.
-func DebugTree(iter IteratorDebug) string {
-	tp := treeprinter.New()
-	iter.DebugTree(tp)
-	return tp.String()
 }

@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/crc"
@@ -85,12 +84,11 @@ type syncQueue struct {
 
 const dequeueBits = 32
 
-// unpack extracts the head and tail indices from a 64-bit unsigned integer.
 func (q *syncQueue) unpack(ptrs uint64) (head, tail uint32) {
 	const mask = 1<<dequeueBits - 1
 	head = uint32((ptrs >> dequeueBits) & mask)
 	tail = uint32(ptrs & mask)
-	return head, tail
+	return
 }
 
 func (q *syncQueue) push(wg *sync.WaitGroup, err *error) {
@@ -152,14 +150,12 @@ func (q *syncQueue) pop(head, tail uint32, err error, queueSemChan chan struct{}
 		*slot.err = err
 		slot.wg = nil
 		slot.err = nil
-		// We need to bump the tail count before releasing the queueSemChan
-		// semaphore as releasing the semaphore can cause a blocked goroutine to
-		// acquire the semaphore and enqueue before we've "freed" space in the
-		// queue.
+		// We need to bump the tail count before signalling the wait group as
+		// signalling the wait group can trigger release a blocked goroutine which
+		// will try to enqueue before we've "freed" space in the queue.
 		q.headTail.Add(1)
 		wg.Done()
-		// Is always non-nil in production, unless using wal package for WAL
-		// failover.
+		// Is always non-nil in production.
 		if queueSemChan != nil {
 			<-queueSemChan
 		}
@@ -168,180 +164,17 @@ func (q *syncQueue) pop(head, tail uint32, err error, queueSemChan chan struct{}
 	return nil
 }
 
-// pendingSyncs abstracts out the handling of pending sync requests. In
-// standalone mode the implementation is a thin wrapper around syncQueue. In
-// the mode where the LogWriter can be subject to failover, there is no queue
-// kept in the LogWriter and the signaling to those waiting for sync is
-// handled in the wal package.
-//
-// To avoid heap allocations due to the use of this interface, the parameters
-// and return values follow some strict rules:
-//   - The PendingSync parameter can be reused by the caller after push returns.
-//     The implementation should be a pointer backed by a struct that is already
-//     heap allocated, which the caller can reuse for the next push call.
-//   - The pendingSyncSnapshot return value must be backed by the pendingSyncs
-//     implementation, so calling snapshotForPop again will cause the previous
-//     snapshot to be overwritten.
-type pendingSyncs interface {
-	push(PendingSync)
-	setBlocked()
-	clearBlocked()
-	empty() bool
-	snapshotForPop() pendingSyncsSnapshot
-	pop(snap pendingSyncsSnapshot, err error) error
-}
-
-type pendingSyncsSnapshot interface {
-	empty() bool
-}
-
-// PendingSync abstracts the sync specification for a record queued on the
-// LogWriter. The only implementations are provided in this package since
-// syncRequested is not exported.
-type PendingSync interface {
-	syncRequested() bool
-}
-
-// The implementation of pendingSyncs in standalone mode.
-type pendingSyncsWithSyncQueue struct {
-	syncQueue
-	syncQueueLen    *base.GaugeSampleMetric
-	snapshotBacking syncQueueSnapshot
-	// See the comment for LogWriterConfig.QueueSemChan.
-	queueSemChan chan struct{}
-}
-
-var _ pendingSyncs = &pendingSyncsWithSyncQueue{}
-
-func (q *pendingSyncsWithSyncQueue) push(ps PendingSync) {
-	ps2 := ps.(*pendingSyncForSyncQueue)
-	q.syncQueue.push(ps2.wg, ps2.err)
-}
-
-func (q *pendingSyncsWithSyncQueue) snapshotForPop() pendingSyncsSnapshot {
-	head, tail, realLength := q.syncQueue.load()
-	q.snapshotBacking = syncQueueSnapshot{
-		head: head,
-		tail: tail,
-	}
-	q.syncQueueLen.AddSample(int64(realLength))
-	return &q.snapshotBacking
-}
-
-func (q *pendingSyncsWithSyncQueue) pop(snap pendingSyncsSnapshot, err error) error {
-	s := snap.(*syncQueueSnapshot)
-	return q.syncQueue.pop(s.head, s.tail, err, q.queueSemChan)
-}
-
-// The implementation of pendingSyncsSnapshot in standalone mode.
-type syncQueueSnapshot struct {
-	head, tail uint32
-}
-
-func (s *syncQueueSnapshot) empty() bool {
-	return s.head == s.tail
-}
-
-// The implementation of pendingSync in standalone mode.
-type pendingSyncForSyncQueue struct {
-	wg  *sync.WaitGroup
-	err *error
-}
-
-func (ps *pendingSyncForSyncQueue) syncRequested() bool {
-	return ps.wg != nil
-}
-
-// The implementation of pendingSyncs in failover mode.
-type pendingSyncsWithHighestSyncIndex struct {
-	// The highest "index" queued that is requesting a sync. Initialized
-	// to NoSyncIndex, and reset to NoSyncIndex after the sync.
-	index           atomic.Int64
-	snapshotBacking PendingSyncIndex
-	// blocked is an atomic boolean which indicates whether syncing is currently
-	// blocked or can proceed. It is used by the implementation of
-	// min-sync-interval to block syncing until the min interval has passed.
-	blocked                   atomic.Bool
-	externalSyncQueueCallback ExternalSyncQueueCallback
-}
-
-// NoSyncIndex is the value of PendingSyncIndex when a sync is not requested.
-const NoSyncIndex = -1
-
-func (si *pendingSyncsWithHighestSyncIndex) init(
-	externalSyncQueueCallback ExternalSyncQueueCallback,
-) {
-	si.index.Store(NoSyncIndex)
-	si.externalSyncQueueCallback = externalSyncQueueCallback
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) push(ps PendingSync) {
-	ps2 := ps.(*PendingSyncIndex)
-	si.index.Store(ps2.Index)
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) setBlocked() {
-	si.blocked.Store(true)
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) clearBlocked() {
-	si.blocked.Store(false)
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) empty() bool {
-	return si.load() == NoSyncIndex
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) snapshotForPop() pendingSyncsSnapshot {
-	si.snapshotBacking = PendingSyncIndex{Index: si.load()}
-	return &si.snapshotBacking
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) load() int64 {
-	index := si.index.Load()
-	if index != NoSyncIndex && si.blocked.Load() {
-		index = NoSyncIndex
-	}
-	return index
-}
-
-func (si *pendingSyncsWithHighestSyncIndex) pop(snap pendingSyncsSnapshot, err error) error {
-	index := snap.(*PendingSyncIndex)
-	if index.Index == NoSyncIndex {
-		return nil
-	}
-	// Set to NoSyncIndex if a higher index has not queued.
-	si.index.CompareAndSwap(index.Index, NoSyncIndex)
-	si.externalSyncQueueCallback(*index, err)
-	return nil
-}
-
-// PendingSyncIndex implements both pendingSyncsSnapshot and PendingSync.
-type PendingSyncIndex struct {
-	// Index is some state meaningful to the user of LogWriter. The LogWriter
-	// itself only examines whether Index is equal to NoSyncIndex.
-	Index int64
-}
-
-func (s *PendingSyncIndex) empty() bool {
-	return s.Index == NoSyncIndex
-}
-
-func (s *PendingSyncIndex) syncRequested() bool {
-	return s.Index != NoSyncIndex
-}
-
 // flusherCond is a specialized condition variable that allows its condition to
 // change and readiness be signalled without holding its associated mutex. In
 // particular, when a waiter is added to syncQueue atomically, this condition
 // variable can be signalled without holding flusher.Mutex.
 type flusherCond struct {
 	mu   *sync.Mutex
-	q    pendingSyncs
+	q    *syncQueue
 	cond sync.Cond
 }
 
-func (c *flusherCond) init(mu *sync.Mutex, q pendingSyncs) {
+func (c *flusherCond) init(mu *sync.Mutex, q *syncQueue) {
 	c.mu = mu
 	c.q = q
 	// Yes, this is a bit circular, but that is intentional. flusherCond.cond.L
@@ -426,12 +259,8 @@ type LogWriter struct {
 	logNum uint32
 	// blockNum is the zero based block number for the current block.
 	blockNum int64
-	// err is any accumulated error. It originates in flusher.err, and is
-	// updated to reflect flusher.err when a block is full and getting enqueued.
-	// Therefore, there is a lag between when flusher.err has a non-nil error,
-	// and when that non-nil error is reflected in LogWriter.err. On close, it
-	// is set to errClosedWriter to inform accidental future calls to
-	// SyncRecord*.
+	// err is any accumulated error. TODO(peter): This needs to be protected in
+	// some fashion. Perhaps using atomic.Value.
 	err error
 	// block is the current block being written. Protected by flusher.Mutex.
 	block *block
@@ -457,10 +286,8 @@ type LogWriter struct {
 		minSyncInterval durationFunc
 		fsyncLatency    prometheus.Histogram
 		pending         []*block
-		// Pushing and popping from pendingSyncs does not require flusher mutex to
-		// be held.
-		pendingSyncs pendingSyncs
-		metrics      *LogWriterMetrics
+		syncQ           syncQueue
+		metrics         *LogWriterMetrics
 	}
 
 	// afterFunc is a hook to allow tests to mock out the timer functionality
@@ -468,22 +295,8 @@ type LogWriter struct {
 	// time.AfterFunc.
 	afterFunc func(d time.Duration, f func()) syncTimer
 
-	// Backing for both pendingSyncs implementations.
-	pendingSyncsBackingQ     pendingSyncsWithSyncQueue
-	pendingSyncsBackingIndex pendingSyncsWithHighestSyncIndex
-
-	pendingSyncForSyncQueueBacking pendingSyncForSyncQueue
-
-	// syncedOffset is the offset in the log that is durably synced after a
-	// flush. This member is used to write the WAL Sync chunk format's "Offset"
-	// field in the header.
-	syncedOffset atomic.Uint64
-
-	// emitFragment is set at runtime depending on which FormatMajorVersion
-	// is used. emitFragment will be set to writing WAL Sync chunk formats
-	// if the FormatMajorVersion is greater than or equal to FormatWALSyncChunks,
-	// otherwise it will write the recyclable chunk format.
-	emitFragment func(n int, p []byte) (remainingP []byte)
+	// See the comment for LogWriterConfig.QueueSemChan.
+	queueSemChan chan struct{}
 }
 
 // LogWriterConfig is a struct used for configuring new LogWriters
@@ -495,27 +308,7 @@ type LogWriterConfig struct {
 	// the syncQueue from overflowing (which will cause a panic). All production
 	// code ensures this is non-nil.
 	QueueSemChan chan struct{}
-
-	// ExternalSyncQueueCallback is set to non-nil when the LogWriter is used
-	// as part of a WAL implementation that can failover between LogWriters.
-	//
-	// In this case, QueueSemChan is always nil, and SyncRecordGeneralized must
-	// be used with a PendingSync parameter that is implemented by
-	// PendingSyncIndex. When an index is synced (which implies all earlier
-	// indices are also synced), this callback is invoked. The caller must not
-	// hold any mutex when invoking this callback, since the lock ordering
-	// requirement in this case is that any higher layer locks (in the wal
-	// package) precede the lower layer locks (in the record package). These
-	// callbacks are serialized since they are invoked from the flushLoop.
-	ExternalSyncQueueCallback ExternalSyncQueueCallback
-
-	// WriteWALSyncOffsets represents whether to write the WAL sync chunk format.
-	WriteWALSyncOffsets bool
 }
-
-// ExternalSyncQueueCallback is to be run when a PendingSync has been
-// processed, either successfully or with an error.
-type ExternalSyncQueueCallback func(doneSync PendingSyncIndex, err error)
 
 // initialAllocatedBlocksCap is the initial capacity of the various slices
 // intended to hold LogWriter blocks. The LogWriter may allocate more blocks
@@ -530,12 +323,7 @@ var blockPool = sync.Pool{
 }
 
 // NewLogWriter returns a new LogWriter.
-//
-// The io.Writer may also be used as an io.Closer and syncer. No other methods
-// will be called on the writer.
-func NewLogWriter(
-	w io.Writer, logNum base.DiskFileNum, logWriterConfig LogWriterConfig,
-) *LogWriter {
+func NewLogWriter(w io.Writer, logNum base.FileNum, logWriterConfig LogWriterConfig) *LogWriter {
 	c, _ := w.(io.Closer)
 	s, _ := w.(syncer)
 	r := &LogWriter{
@@ -550,32 +338,14 @@ func NewLogWriter(
 		afterFunc: func(d time.Duration, f func()) syncTimer {
 			return time.AfterFunc(d, f)
 		},
+		queueSemChan: logWriterConfig.QueueSemChan,
 	}
-
-	if logWriterConfig.WriteWALSyncOffsets {
-		r.emitFragment = r.emitFragmentSyncOffsets
-	} else {
-		r.emitFragment = r.emitFragmentRecyclable
-	}
-
-	m := &LogWriterMetrics{}
-	if logWriterConfig.ExternalSyncQueueCallback != nil {
-		r.pendingSyncsBackingIndex.init(logWriterConfig.ExternalSyncQueueCallback)
-		r.flusher.pendingSyncs = &r.pendingSyncsBackingIndex
-	} else {
-		r.pendingSyncsBackingQ = pendingSyncsWithSyncQueue{
-			syncQueueLen: &m.SyncQueueLen,
-			queueSemChan: logWriterConfig.QueueSemChan,
-		}
-		r.flusher.pendingSyncs = &r.pendingSyncsBackingQ
-	}
-
 	r.free.blocks = make([]*block, 0, initialAllocatedBlocksCap)
 	r.block = blockPool.Get().(*block)
-	r.flusher.ready.init(&r.flusher.Mutex, r.flusher.pendingSyncs)
+	r.flusher.ready.init(&r.flusher.Mutex, &r.flusher.syncQ)
 	r.flusher.closed = make(chan struct{})
 	r.flusher.pending = make([]*block, 0, cap(r.free.blocks))
-	r.flusher.metrics = m
+	r.flusher.metrics = &LogWriterMetrics{}
 
 	f := &r.flusher
 	f.minSyncInterval = logWriterConfig.WALMinSyncInterval
@@ -592,23 +362,18 @@ func (w *LogWriter) flushLoop(context.Context) {
 	f.Lock()
 
 	// Initialize idleStartTime to when the loop starts.
-	idleStartTime := crtime.NowMono()
+	idleStartTime := time.Now()
 	var syncTimer syncTimer
 	defer func() {
 		// Capture the idle duration between the last piece of work and when the
 		// loop terminated.
-		f.metrics.WriteThroughput.IdleDuration += idleStartTime.Elapsed()
+		f.metrics.WriteThroughput.IdleDuration += time.Since(idleStartTime)
 		if syncTimer != nil {
 			syncTimer.Stop()
 		}
 		close(f.closed)
 		f.Unlock()
 	}()
-
-	// writtenOffset is the amount of data that has been written
-	// but not necessarily synced. This is used to update logWriter's
-	// syncedOffset after a sync.
-	var writtenOffset uint64 = 0
 
 	// The flush loop performs flushing of full and partial data blocks to the
 	// underlying writer (LogWriter.w), syncing of the writer, and notification
@@ -656,14 +421,14 @@ func (w *LogWriter) flushLoop(context.Context) {
 			// the current block can be added to the pending blocks list after we release
 			// the flusher lock, but it won't be part of pending.
 			written := w.block.written.Load()
-			if len(f.pending) > 0 || written > w.block.flushed || !f.pendingSyncs.empty() {
+			if len(f.pending) > 0 || written > w.block.flushed || !f.syncQ.empty() {
 				break
 			}
 			if f.close {
 				// If the writer is closed, pretend the sync timer fired immediately so
 				// that we can process any queued sync requests.
-				f.pendingSyncs.clearBlocked()
-				if !f.pendingSyncs.empty() {
+				f.syncQ.clearBlocked()
+				if !f.syncQ.empty() {
 					break
 				}
 				return
@@ -672,19 +437,7 @@ func (w *LogWriter) flushLoop(context.Context) {
 			continue
 		}
 		// Found work to do, so no longer idle.
-		//
-		// NB: it is safe to read pending before loading from the syncQ since
-		// mutations to pending require the w.flusher mutex, which is held here.
-		// There is no risk that someone will concurrently add to pending, so the
-		// following sequence, which would pick up a syncQ entry without the
-		// corresponding data, is impossible:
-		//
-		// Thread enqueueing       This thread
-		//                         1. read pending
-		// 2. add block to pending
-		// 3. add to syncQ
-		//                         4. read syncQ
-		workStartTime := crtime.NowMono()
+		workStartTime := time.Now()
 		idleDuration := workStartTime.Sub(idleStartTime)
 		pending = append(pending[:0], f.pending...)
 		f.pending = f.pending[:0]
@@ -693,7 +446,8 @@ func (w *LogWriter) flushLoop(context.Context) {
 		// Grab the list of sync waiters. Note that syncQueue.load() will return
 		// 0,0 while we're waiting for the min-sync-interval to expire. This
 		// allows flushing to proceed even if we're not ready to sync.
-		snap := f.pendingSyncs.snapshotForPop()
+		head, tail, realSyncQLen := f.syncQ.load()
+		f.metrics.SyncQueueLen.AddSample(int64(realSyncQLen))
 
 		// Grab the portion of the current block that requires flushing. Note that
 		// the current block can be added to the pending blocks list after we
@@ -705,35 +459,29 @@ func (w *LogWriter) flushLoop(context.Context) {
 		data := w.block.buf[w.block.flushed:written]
 		w.block.flushed = written
 
-		fErr := f.err
-		f.Unlock()
 		// If flusher has an error, we propagate it to waiters. Note in spite of
 		// error we consume the pending list above to free blocks for writers.
-		if fErr != nil {
-			// NB: pop may invoke ExternalSyncQueueCallback, which is why we have
-			// called f.Unlock() above. We will acquire the lock again below.
-			f.pendingSyncs.pop(snap, fErr)
+		if f.err != nil {
+			f.syncQ.pop(head, tail, f.err, w.queueSemChan)
 			// Update the idleStartTime if work could not be done, so that we don't
 			// include the duration we tried to do work as idle. We don't bother
 			// with the rest of the accounting, which means we will undercount.
-			idleStartTime = crtime.NowMono()
-			f.Lock()
+			idleStartTime = time.Now()
 			continue
 		}
-		writtenOffset += uint64(len(data))
-		synced, syncLatency, bytesWritten, err := w.flushPending(data, pending, snap)
+		f.Unlock()
+		synced, syncLatency, bytesWritten, err := w.flushPending(data, pending, head, tail)
 		f.Lock()
 		if synced && f.fsyncLatency != nil {
-			w.syncedOffset.Store(writtenOffset)
 			f.fsyncLatency.Observe(float64(syncLatency))
 		}
 		f.err = err
 		if f.err != nil {
-			f.pendingSyncs.clearBlocked()
+			f.syncQ.clearBlocked()
 			// Update the idleStartTime if work could not be done, so that we don't
 			// include the duration we tried to do work as idle. We don't bother
 			// with the rest of the accounting, which means we will undercount.
-			idleStartTime = crtime.NowMono()
+			idleStartTime = time.Now()
 			continue
 		}
 
@@ -741,10 +489,10 @@ func (w *LogWriter) flushLoop(context.Context) {
 			// A sync was performed. Make sure we've waited for the min sync
 			// interval before syncing again.
 			if min := f.minSyncInterval(); min > 0 {
-				f.pendingSyncs.setBlocked()
+				f.syncQ.setBlocked()
 				if syncTimer == nil {
 					syncTimer = w.afterFunc(min, func() {
-						f.pendingSyncs.clearBlocked()
+						f.syncQ.clearBlocked()
 						f.ready.Signal()
 					})
 				} else {
@@ -753,7 +501,7 @@ func (w *LogWriter) flushLoop(context.Context) {
 			}
 		}
 		// Finished work, and started idling.
-		idleStartTime = crtime.NowMono()
+		idleStartTime = time.Now()
 		workDuration := idleStartTime.Sub(workStartTime)
 		f.metrics.WriteThroughput.Bytes += bytesWritten
 		f.metrics.WriteThroughput.WorkDuration += workDuration
@@ -762,7 +510,7 @@ func (w *LogWriter) flushLoop(context.Context) {
 }
 
 func (w *LogWriter) flushPending(
-	data []byte, pending []*block, snap pendingSyncsSnapshot,
+	data []byte, pending []*block, head, tail uint32,
 ) (synced bool, syncLatency time.Duration, bytesWritten int64, err error) {
 	defer func() {
 		// Translate panics into errors. The errors will cause flushLoop to shut
@@ -785,16 +533,14 @@ func (w *LogWriter) flushPending(
 		_, err = w.w.Write(data)
 	}
 
-	synced = !snap.empty()
+	synced = head != tail
 	if synced {
 		if err == nil && w.s != nil {
 			syncLatency, err = w.syncWithLatency()
-		} else {
-			synced = false
 		}
 		f := &w.flusher
-		if popErr := f.pendingSyncs.pop(snap, err); popErr != nil {
-			return synced, syncLatency, bytesWritten, firstError(err, popErr)
+		if popErr := f.syncQ.pop(head, tail, err, w.queueSemChan); popErr != nil {
+			return synced, syncLatency, bytesWritten, popErr
 		}
 	}
 
@@ -802,9 +548,9 @@ func (w *LogWriter) flushPending(
 }
 
 func (w *LogWriter) syncWithLatency() (time.Duration, error) {
-	start := crtime.NowMono()
+	start := time.Now()
 	err := w.s.Sync()
-	syncLatency := start.Elapsed()
+	syncLatency := time.Since(start)
 	return syncLatency, err
 }
 
@@ -847,16 +593,6 @@ func (w *LogWriter) queueBlock() {
 // Close flushes and syncs any unwritten data and closes the writer.
 // Where required, external synchronisation is provided by commitPipeline.mu.
 func (w *LogWriter) Close() error {
-	return w.closeInternal(PendingSyncIndex{Index: NoSyncIndex})
-}
-
-// CloseWithLastQueuedRecord is like Close, but optionally accepts a
-// lastQueuedRecord, that the caller will be notified about when synced.
-func (w *LogWriter) CloseWithLastQueuedRecord(lastQueuedRecord PendingSyncIndex) error {
-	return w.closeInternal(lastQueuedRecord)
-}
-
-func (w *LogWriter) closeInternal(lastQueuedRecord PendingSyncIndex) error {
 	f := &w.flusher
 
 	// Emit an EOF trailer signifying the end of this log. This helps readers
@@ -883,21 +619,18 @@ func (w *LogWriter) closeInternal(lastQueuedRecord PendingSyncIndex) error {
 		syncLatency, err = w.syncWithLatency()
 	}
 	f.Lock()
-	if err == nil && f.fsyncLatency != nil {
+	if f.fsyncLatency != nil {
 		f.fsyncLatency.Observe(float64(syncLatency))
 	}
 	free := w.free.blocks
 	f.Unlock()
 
-	// NB: the caller of closeInternal may not care about a non-nil cerr below
-	// if all queued writes have been successfully written and synced.
-	if lastQueuedRecord.Index != NoSyncIndex {
-		w.pendingSyncsBackingIndex.externalSyncQueueCallback(lastQueuedRecord, err)
-	}
 	if w.c != nil {
 		cerr := w.c.Close()
 		w.c = nil
-		err = firstError(err, cerr)
+		if cerr != nil {
+			return cerr
+		}
 	}
 
 	for _, b := range free {
@@ -908,15 +641,6 @@ func (w *LogWriter) closeInternal(lastQueuedRecord PendingSyncIndex) error {
 
 	w.err = errClosedWriter
 	return err
-}
-
-// firstError returns the first non-nil error of err0 and err1, or nil if both
-// are nil.
-func firstError(err0, err1 error) error {
-	if err0 != nil {
-		return err0
-	}
-	return err1
 }
 
 // WriteRecord writes a complete record. Returns the offset just past the end
@@ -935,16 +659,6 @@ func (w *LogWriter) WriteRecord(p []byte) (int64, error) {
 func (w *LogWriter) SyncRecord(
 	p []byte, wg *sync.WaitGroup, err *error,
 ) (logSize int64, err2 error) {
-	w.pendingSyncForSyncQueueBacking = pendingSyncForSyncQueue{
-		wg:  wg,
-		err: err,
-	}
-	return w.SyncRecordGeneralized(p, &w.pendingSyncForSyncQueueBacking)
-}
-
-// SyncRecordGeneralized is a version of SyncRecord that accepts a
-// PendingSync.
-func (w *LogWriter) SyncRecordGeneralized(p []byte, ps PendingSync) (logSize int64, err2 error) {
 	if w.err != nil {
 		return -1, w.err
 	}
@@ -957,14 +671,14 @@ func (w *LogWriter) SyncRecordGeneralized(p []byte, ps PendingSync) (logSize int
 		p = w.emitFragment(i, p)
 	}
 
-	if ps.syncRequested() {
+	if wg != nil {
 		// If we've been asked to persist the record, add the WaitGroup to the sync
 		// queue and signal the flushLoop. Note that flushLoop will write partial
 		// blocks to the file if syncing has been requested. The contract is that
 		// any record written to the LogWriter to this point will be flushed to the
 		// OS and synced to disk.
 		f := &w.flusher
-		f.pendingSyncs.push(ps)
+		f.syncQ.push(wg, err)
 		f.ready.Signal()
 	}
 
@@ -982,11 +696,6 @@ func (w *LogWriter) Size() int64 {
 	return w.blockNum*blockSize + int64(w.block.written.Load())
 }
 
-// emitEOFTrailer writes a special recyclable chunk header to signal EOF.
-// The reason why this function writes the recyclable chunk header instead
-// of having a function for writing recyclable and WAL sync chunks as
-// emitFragment does it because there is no reason to add 8 additional
-// bytes to the EOFTrailer for the SyncedOffset as it will be zeroed out anyway.
 func (w *LogWriter) emitEOFTrailer() {
 	// Write a recyclable chunk header with a different log number.  Readers
 	// will treat the header as EOF when the log number does not match.
@@ -994,12 +703,12 @@ func (w *LogWriter) emitEOFTrailer() {
 	i := b.written.Load()
 	binary.LittleEndian.PutUint32(b.buf[i+0:i+4], 0) // CRC
 	binary.LittleEndian.PutUint16(b.buf[i+4:i+6], 0) // Size
-	b.buf[i+6] = recyclableFullChunkEncoding
+	b.buf[i+6] = recyclableFullChunkType
 	binary.LittleEndian.PutUint32(b.buf[i+7:i+11], w.logNum+1) // Log number
 	b.written.Store(i + int32(recyclableHeaderSize))
 }
 
-func (w *LogWriter) emitFragmentRecyclable(n int, p []byte) (remainingP []byte) {
+func (w *LogWriter) emitFragment(n int, p []byte) (remainingP []byte) {
 	b := w.block
 	i := b.written.Load()
 	first := n == 0
@@ -1007,15 +716,15 @@ func (w *LogWriter) emitFragmentRecyclable(n int, p []byte) (remainingP []byte) 
 
 	if last {
 		if first {
-			b.buf[i+6] = recyclableFullChunkEncoding
+			b.buf[i+6] = recyclableFullChunkType
 		} else {
-			b.buf[i+6] = recyclableLastChunkEncoding
+			b.buf[i+6] = recyclableLastChunkType
 		}
 	} else {
 		if first {
-			b.buf[i+6] = recyclableFirstChunkEncoding
+			b.buf[i+6] = recyclableFirstChunkType
 		} else {
-			b.buf[i+6] = recyclableMiddleChunkEncoding
+			b.buf[i+6] = recyclableMiddleChunkType
 		}
 	}
 
@@ -1030,59 +739,18 @@ func (w *LogWriter) emitFragmentRecyclable(n int, p []byte) (remainingP []byte) 
 	if blockSize-b.written.Load() < recyclableHeaderSize {
 		// There is no room for another fragment in the block, so fill the
 		// remaining bytes with zeros and queue the block for flushing.
-		clear(b.buf[b.written.Load():])
+		for i := b.written.Load(); i < blockSize; i++ {
+			b.buf[i] = 0
+		}
 		w.queueBlock()
 	}
 	return p[r:]
 }
 
-func (w *LogWriter) emitFragmentSyncOffsets(n int, p []byte) (remainingP []byte) {
-	b := w.block
-	i := b.written.Load()
-	first := n == 0
-	last := blockSize-i-walSyncHeaderSize >= int32(len(p))
-
-	if last {
-		if first {
-			b.buf[i+6] = walSyncFullChunkEncoding
-		} else {
-			b.buf[i+6] = walSyncLastChunkEncoding
-		}
-	} else {
-		if first {
-			b.buf[i+6] = walSyncFirstChunkEncoding
-		} else {
-			b.buf[i+6] = walSyncMiddleChunkEncoding
-		}
-	}
-
-	binary.LittleEndian.PutUint32(b.buf[i+7:i+11], w.logNum)
-	binary.LittleEndian.PutUint64(b.buf[i+11:i+19], w.syncedOffset.Load())
-
-	r := copy(b.buf[i+walSyncHeaderSize:], p)
-	j := i + int32(walSyncHeaderSize+r)
-	binary.LittleEndian.PutUint32(b.buf[i+0:i+4], crc.New(b.buf[i+6:j]).Value())
-	binary.LittleEndian.PutUint16(b.buf[i+4:i+6], uint16(r))
-	b.written.Store(j)
-
-	if blockSize-b.written.Load() < walSyncHeaderSize {
-		// There is no room for another fragment in the block, so fill the
-		// remaining bytes with zeros and queue the block for flushing.
-		clear(b.buf[b.written.Load():])
-		w.queueBlock()
-	}
-	return p[r:]
-}
-
-// Metrics must typically be called after Close, since the callee will no
-// longer modify the returned LogWriterMetrics. It is also current if there is
-// nothing left to flush in the flush loop, but that is an implementation
-// detail that callers should not rely on.
-func (w *LogWriter) Metrics() LogWriterMetrics {
-	w.flusher.Lock()
-	defer w.flusher.Unlock()
-	m := *w.flusher.metrics
-	return m
+// Metrics must be called after Close. The callee will no longer modify the
+// returned LogWriterMetrics.
+func (w *LogWriter) Metrics() *LogWriterMetrics {
+	return w.flusher.metrics
 }
 
 // LogWriterMetrics contains misc metrics for the log writer.

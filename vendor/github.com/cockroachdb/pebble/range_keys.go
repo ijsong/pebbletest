@@ -5,14 +5,10 @@
 package pebble
 
 import (
-	"context"
-
-	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/sstable"
 )
 
@@ -23,17 +19,10 @@ func (i *Iterator) constructRangeKeyIter() {
 		&i.comparer, i.seqNum, i.opts.LowerBound, i.opts.UpperBound,
 		&i.hasPrefix, &i.prefixOrFullSeekKey, false /* internalKeys */, &i.rangeKey.rangeKeyBuffers.internal)
 
-	if i.opts.DebugRangeKeyStack {
-		// The default logger is preferable to i.opts.getLogger(), at least in the
-		// metamorphic test.
-		i.rangeKey.rangeKeyIter = keyspan.InjectLogging(i.rangeKey.rangeKeyIter, base.DefaultLogger)
-	}
-
 	// If there's an indexed batch with range keys, include it.
 	if i.batch != nil {
 		if i.batch.index == nil {
-			// This isn't an indexed batch. We shouldn't have gotten this far.
-			panic(errors.AssertionFailedf("creating an iterator over an unindexed batch"))
+			i.rangeKey.iterConfig.AddLevel(newErrorKeyspanIter(ErrNotIndexed))
 		} else {
 			// Only include the batch's range key iterator if it has any keys.
 			// NB: This can force reconstruction of the rangekey iterator stack
@@ -46,85 +35,58 @@ func (i *Iterator) constructRangeKeyIter() {
 		}
 	}
 
-	if !i.batchOnlyIter {
-		// Next are the flushables: memtables and large batches.
-		if i.readState != nil {
-			for j := len(i.readState.memtables) - 1; j >= 0; j-- {
-				mem := i.readState.memtables[j]
-				// We only need to read from memtables which contain sequence numbers older
-				// than seqNum.
-				if logSeqNum := mem.logSeqNum; logSeqNum >= i.seqNum {
-					continue
-				}
-				if rki := mem.newRangeKeyIter(&i.opts); rki != nil {
-					i.rangeKey.iterConfig.AddLevel(rki)
-				}
-			}
-		}
-
-		current := i.version
-		if current == nil {
-			current = i.readState.current
-		}
-		// Next are the file levels: L0 sub-levels followed by lower levels.
-
-		// Add file-specific iterators for L0 files containing range keys. We
-		// maintain a separate manifest.LevelMetadata for each level containing only
-		// files that contain range keys, however we don't compute a separate
-		// L0Sublevels data structure too.
-		//
-		// We first use L0's LevelMetadata to peek and see whether L0 contains any
-		// range keys at all. If it does, we create a range key level iterator per
-		// level that contains range keys using the information from L0Sublevels.
-		// Some sublevels may not contain any range keys, and we need to iterate
-		// through the fileMetadata to determine that. Since L0's file count should
-		// not significantly exceed ~1000 files (see L0CompactionFileThreshold),
-		// this should be okay.
-		if !current.RangeKeyLevels[0].Empty() {
-			// L0 contains at least 1 file containing range keys.
-			// Add level iterators for the L0 sublevels, iterating from newest to
-			// oldest.
-			for j := len(current.L0SublevelFiles) - 1; j >= 0; j-- {
-				iter := current.L0SublevelFiles[j].Iter()
-				if !containsAnyRangeKeys(iter) {
-					continue
-				}
-
-				li := i.rangeKey.iterConfig.NewLevelIter()
-				li.Init(
-					i.ctx,
-					i.opts.SpanIterOptions(),
-					i.cmp,
-					i.newIterRangeKey,
-					iter.Filter(manifest.KeyTypeRange),
-					manifest.L0Sublevel(j),
-					manifest.KeyTypeRange,
-				)
-				i.rangeKey.iterConfig.AddLevel(li)
-			}
-		}
-
-		// Add level iterators for the non-empty non-L0 levels.
-		for level := 1; level < len(current.RangeKeyLevels); level++ {
-			if current.RangeKeyLevels[level].Empty() {
+	// Next are the flushables: memtables and large batches.
+	if i.readState != nil {
+		for j := len(i.readState.memtables) - 1; j >= 0; j-- {
+			mem := i.readState.memtables[j]
+			// We only need to read from memtables which contain sequence numbers older
+			// than seqNum.
+			if logSeqNum := mem.logSeqNum; logSeqNum >= i.seqNum {
 				continue
 			}
-			li := i.rangeKey.iterConfig.NewLevelIter()
-			spanIterOpts := i.opts.SpanIterOptions()
-			li.Init(i.ctx, spanIterOpts, i.cmp, i.newIterRangeKey, current.RangeKeyLevels[level].Iter(),
-				manifest.Level(level), manifest.KeyTypeRange)
-			i.rangeKey.iterConfig.AddLevel(li)
+			if rki := mem.newRangeKeyIter(&i.opts); rki != nil {
+				i.rangeKey.iterConfig.AddLevel(rki)
+			}
 		}
 	}
-}
 
-func containsAnyRangeKeys(iter manifest.LevelIterator) bool {
-	for f := iter.First(); f != nil; f = iter.Next() {
-		if f.HasRangeKeys {
-			return true
-		}
+	current := i.version
+	if current == nil {
+		current = i.readState.current
 	}
-	return false
+	// Next are the file levels: L0 sub-levels followed by lower levels.
+	//
+	// Add file-specific iterators for L0 files containing range keys. This is less
+	// efficient than using levelIters for sublevels of L0 files containing
+	// range keys, but range keys are expected to be sparse anyway, reducing the
+	// cost benefit of maintaining a separate L0Sublevels instance for range key
+	// files and then using it here.
+	//
+	// NB: We iterate L0's files in reverse order. They're sorted by
+	// LargestSeqNum ascending, and we need to add them to the merging iterator
+	// in LargestSeqNum descending to preserve the merging iterator's invariants
+	// around Key Trailer order.
+	iter := current.RangeKeyLevels[0].Iter()
+	for f := iter.Last(); f != nil; f = iter.Prev() {
+		spanIter, err := i.newIterRangeKey(f, i.opts.SpanIterOptions())
+		if err != nil {
+			i.rangeKey.iterConfig.AddLevel(&errorKeyspanIter{err: err})
+			continue
+		}
+		i.rangeKey.iterConfig.AddLevel(spanIter)
+	}
+
+	// Add level iterators for the non-empty non-L0 levels.
+	for level := 1; level < len(current.RangeKeyLevels); level++ {
+		if current.RangeKeyLevels[level].Empty() {
+			continue
+		}
+		li := i.rangeKey.iterConfig.NewLevelIter()
+		spanIterOpts := i.opts.SpanIterOptions()
+		li.Init(spanIterOpts, i.cmp, i.newIterRangeKey, current.RangeKeyLevels[level].Iter(),
+			manifest.Level(level), manifest.KeyTypeRange)
+		i.rangeKey.iterConfig.AddLevel(li)
+	}
 }
 
 // Range key masking
@@ -225,10 +187,9 @@ func containsAnyRangeKeys(iter manifest.LevelIterator) bool {
 // result is ignored, and the block is read.
 
 type rangeKeyMasking struct {
-	cmp       base.Compare
-	suffixCmp base.CompareRangeSuffixes
-	split     base.Split
-	filter    BlockPropertyFilterMask
+	cmp    base.Compare
+	split  base.Split
+	filter BlockPropertyFilterMask
 	// maskActiveSuffix holds the suffix of a range key currently acting as a
 	// mask, hiding point keys with suffixes greater than it. maskActiveSuffix
 	// is only ever non-nil if IterOptions.RangeKeyMasking.Suffix is non-nil.
@@ -244,10 +205,9 @@ type rangeKeyMasking struct {
 	parent   *Iterator
 }
 
-func (m *rangeKeyMasking) init(parent *Iterator, c *base.Comparer) {
-	m.cmp = c.Compare
-	m.suffixCmp = c.CompareRangeSuffixes
-	m.split = c.Split
+func (m *rangeKeyMasking) init(parent *Iterator, cmp base.Compare, split base.Split) {
+	m.cmp = cmp
+	m.split = split
 	if parent.opts.RangeKeyMasking.Filter != nil {
 		m.filter = parent.opts.RangeKeyMasking.Filter()
 	}
@@ -272,10 +232,10 @@ func (m *rangeKeyMasking) SpanChanged(s *keyspan.Span) {
 				if s.Keys[j].Suffix == nil {
 					continue
 				}
-				if m.suffixCmp(s.Keys[j].Suffix, m.parent.opts.RangeKeyMasking.Suffix) < 0 {
+				if m.cmp(s.Keys[j].Suffix, m.parent.opts.RangeKeyMasking.Suffix) < 0 {
 					continue
 				}
-				if len(m.maskActiveSuffix) == 0 || m.suffixCmp(m.maskActiveSuffix, s.Keys[j].Suffix) > 0 {
+				if len(m.maskActiveSuffix) == 0 || m.cmp(m.maskActiveSuffix, s.Keys[j].Suffix) > 0 {
 					m.maskSpan = s
 					m.maskActiveSuffix = append(m.maskActiveSuffix[:0], s.Keys[j].Suffix...)
 				}
@@ -354,7 +314,7 @@ func (m *rangeKeyMasking) SkipPoint(userKey []byte) bool {
 	// the InterleavingIter). Skip the point key if the range key's suffix is
 	// greater than the point key's suffix.
 	pointSuffix := userKey[m.split(userKey):]
-	if len(pointSuffix) > 0 && m.suffixCmp(m.maskActiveSuffix, pointSuffix) < 0 {
+	if len(pointSuffix) > 0 && m.cmp(m.maskActiveSuffix, pointSuffix) < 0 {
 		m.parent.stats.RangeKeyStats.SkippedPoints++
 		return true
 	}
@@ -405,14 +365,6 @@ func (m *rangeKeyMasking) Intersects(prop []byte) (bool, error) {
 		return true, nil
 	}
 	return m.filter.Intersects(prop)
-}
-
-func (m *rangeKeyMasking) SyntheticSuffixIntersects(prop []byte, suffix []byte) (bool, error) {
-	if m.maskSpan == nil {
-		// No span is actively masking.
-		return true, nil
-	}
-	return m.filter.SyntheticSuffixIntersects(prop, suffix)
 }
 
 // KeyIsWithinLowerBound implements the limitedBlockPropertyFilter interface
@@ -495,8 +447,8 @@ var _ internalIterator = (*lazyCombinedIter)(nil)
 // operations that land in the middle of a range key and must truncate to the
 // user-provided seek key.
 func (i *lazyCombinedIter) initCombinedIteration(
-	dir int8, pointKV *base.InternalKV, seekKey []byte,
-) *base.InternalKV {
+	dir int8, pointKey *InternalKey, pointValue base.LazyValue, seekKey []byte,
+) (*InternalKey, base.LazyValue) {
 	// Invariant: i.parent.rangeKey is nil.
 	// Invariant: !i.combinedIterState.initialized.
 	if invariants.Enabled {
@@ -544,11 +496,11 @@ func (i *lazyCombinedIter) initCombinedIteration(
 		// key instead to `bar`. It is guaranteed that no range key exists
 		// earlier than `bar`, otherwise a levelIter would've observed it and
 		// set `combinedIterState.key` to its start key.
-		if pointKV != nil {
-			if dir == +1 && i.parent.cmp(i.combinedIterState.key, pointKV.K.UserKey) > 0 {
-				seekKey = pointKV.K.UserKey
-			} else if dir == -1 && i.parent.cmp(seekKey, pointKV.K.UserKey) < 0 {
-				seekKey = pointKV.K.UserKey
+		if pointKey != nil {
+			if dir == +1 && i.parent.cmp(i.combinedIterState.key, pointKey.UserKey) > 0 {
+				seekKey = pointKey.UserKey
+			} else if dir == -1 && i.parent.cmp(seekKey, pointKey.UserKey) < 0 {
+				seekKey = pointKey.UserKey
 			}
 		}
 	}
@@ -586,7 +538,7 @@ func (i *lazyCombinedIter) initCombinedIteration(
 	//
 	// In the forward direction (invert for backwards), the seek key is a key
 	// guaranteed to find the smallest range key that's greater than the last
-	// key the iterator returned. The range key may be less than pointKV, in
+	// key the iterator returned. The range key may be less than pointKey, in
 	// which case the range key will be interleaved next instead of the point
 	// key.
 	if dir == +1 {
@@ -594,99 +546,103 @@ func (i *lazyCombinedIter) initCombinedIteration(
 		if i.parent.hasPrefix {
 			prefix = i.parent.prefixOrFullSeekKey
 		}
-		return i.parent.rangeKey.iiter.InitSeekGE(prefix, seekKey, pointKV)
+		return i.parent.rangeKey.iiter.InitSeekGE(prefix, seekKey, pointKey, pointValue)
 	}
-	return i.parent.rangeKey.iiter.InitSeekLT(seekKey, pointKV)
+	return i.parent.rangeKey.iiter.InitSeekLT(seekKey, pointKey, pointValue)
 }
 
-func (i *lazyCombinedIter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+func (i *lazyCombinedIter) SeekGE(
+	key []byte, flags base.SeekGEFlags,
+) (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.SeekGE(key, flags)
 	}
-	kv := i.pointIter.SeekGE(key, flags)
+	k, v := i.pointIter.SeekGE(key, flags)
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(+1, kv, key)
+		return i.initCombinedIteration(+1, k, v, key)
 	}
-	return kv
+	return k, v
 }
 
 func (i *lazyCombinedIter) SeekPrefixGE(
 	prefix, key []byte, flags base.SeekGEFlags,
-) *base.InternalKV {
+) (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.SeekPrefixGE(prefix, key, flags)
 	}
-	kv := i.pointIter.SeekPrefixGE(prefix, key, flags)
+	k, v := i.pointIter.SeekPrefixGE(prefix, key, flags)
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(+1, kv, key)
+		return i.initCombinedIteration(+1, k, v, key)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+func (i *lazyCombinedIter) SeekLT(
+	key []byte, flags base.SeekLTFlags,
+) (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.SeekLT(key, flags)
 	}
-	kv := i.pointIter.SeekLT(key, flags)
+	k, v := i.pointIter.SeekLT(key, flags)
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(-1, kv, key)
+		return i.initCombinedIteration(-1, k, v, key)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) First() *base.InternalKV {
+func (i *lazyCombinedIter) First() (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.First()
 	}
-	kv := i.pointIter.First()
+	k, v := i.pointIter.First()
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(+1, kv, nil)
+		return i.initCombinedIteration(+1, k, v, nil)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) Last() *base.InternalKV {
+func (i *lazyCombinedIter) Last() (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.Last()
 	}
-	kv := i.pointIter.Last()
+	k, v := i.pointIter.Last()
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(-1, kv, nil)
+		return i.initCombinedIteration(-1, k, v, nil)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) Next() *base.InternalKV {
+func (i *lazyCombinedIter) Next() (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.Next()
 	}
-	kv := i.pointIter.Next()
+	k, v := i.pointIter.Next()
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(+1, kv, nil)
+		return i.initCombinedIteration(+1, k, v, nil)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) NextPrefix(succKey []byte) *base.InternalKV {
+func (i *lazyCombinedIter) NextPrefix(succKey []byte) (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.NextPrefix(succKey)
 	}
-	kv := i.pointIter.NextPrefix(succKey)
+	k, v := i.pointIter.NextPrefix(succKey)
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(+1, kv, nil)
+		return i.initCombinedIteration(+1, k, v, nil)
 	}
-	return kv
+	return k, v
 }
 
-func (i *lazyCombinedIter) Prev() *base.InternalKV {
+func (i *lazyCombinedIter) Prev() (*InternalKey, base.LazyValue) {
 	if i.combinedIterState.initialized {
 		return i.parent.rangeKey.iiter.Prev()
 	}
-	kv := i.pointIter.Prev()
+	k, v := i.pointIter.Prev()
 	if i.combinedIterState.triggered {
-		return i.initCombinedIteration(-1, kv, nil)
+		return i.initCombinedIteration(-1, k, v, nil)
 	}
-	return kv
+	return k, v
 }
 
 func (i *lazyCombinedIter) Error() error {
@@ -709,24 +665,6 @@ func (i *lazyCombinedIter) SetBounds(lower, upper []byte) {
 		return
 	}
 	i.pointIter.SetBounds(lower, upper)
-}
-
-func (i *lazyCombinedIter) SetContext(ctx context.Context) {
-	if i.combinedIterState.initialized {
-		i.parent.rangeKey.iiter.SetContext(ctx)
-		return
-	}
-	i.pointIter.SetContext(ctx)
-}
-
-// DebugTree is part of the InternalIterator interface.
-func (i *lazyCombinedIter) DebugTree(tp treeprinter.Node) {
-	n := tp.Childf("%T(%p)", i, i)
-	if i.combinedIterState.initialized {
-		i.parent.rangeKey.iiter.DebugTree(n)
-	} else {
-		i.pointIter.DebugTree(n)
-	}
 }
 
 func (i *lazyCombinedIter) String() string {

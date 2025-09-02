@@ -7,8 +7,6 @@ package pebble
 import (
 	"sync"
 	"time"
-
-	"github.com/cockroachdb/crlib/crtime"
 )
 
 // deletionPacerInfo contains any info from the db necessary to make deletion
@@ -60,25 +58,18 @@ const deletePacerHistory = 5 * time.Minute
 // normally limit deletes (when we are not falling behind or running out of
 // space). A value of 0.0 disables pacing.
 func newDeletionPacer(
-	now crtime.Mono,
-	freeSpaceThreshold uint64,
-	targetByteDeletionRate int64,
-	freeSpaceTimeframe time.Duration,
-	obsoleteBytesMaxRatio float64,
-	obsoleteBytesTimeframe time.Duration,
-	getInfo func() deletionPacerInfo,
+	now time.Time, targetByteDeletionRate int64, getInfo func() deletionPacerInfo,
 ) *deletionPacer {
 	d := &deletionPacer{
-		freeSpaceThreshold: freeSpaceThreshold,
-		freeSpaceTimeframe: freeSpaceTimeframe,
+		freeSpaceThreshold: 16 << 30, // 16 GB
+		freeSpaceTimeframe: 10 * time.Second,
 
-		obsoleteBytesMaxRatio:  obsoleteBytesMaxRatio,
-		obsoleteBytesTimeframe: obsoleteBytesTimeframe,
+		obsoleteBytesMaxRatio:  0.20,
+		obsoleteBytesTimeframe: 5 * time.Minute,
 
 		targetByteDeletionRate: targetByteDeletionRate,
 		getInfo:                getInfo,
 	}
-
 	d.mu.history.Init(now, deletePacerHistory)
 	return d
 }
@@ -88,7 +79,7 @@ func newDeletionPacer(
 // deletion rate accordingly.
 //
 // ReportDeletion is thread-safe.
-func (p *deletionPacer) ReportDeletion(now crtime.Mono, bytesToDelete uint64) {
+func (p *deletionPacer) ReportDeletion(now time.Time, bytesToDelete uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.mu.history.Add(now, int64(bytesToDelete))
@@ -98,7 +89,7 @@ func (p *deletionPacer) ReportDeletion(now crtime.Mono, bytesToDelete uint64) {
 // deleting the given number of bytes.
 //
 // PacingDelay is thread-safe.
-func (p *deletionPacer) PacingDelay(now crtime.Mono, bytesToDelete uint64) (waitSeconds float64) {
+func (p *deletionPacer) PacingDelay(now time.Time, bytesToDelete uint64) (waitSeconds float64) {
 	if p.targetByteDeletionRate == 0 {
 		// Pacing disabled.
 		return 0.0
@@ -145,7 +136,7 @@ func (p *deletionPacer) PacingDelay(now crtime.Mono, bytesToDelete uint64) (wait
 // are effectively rounded down to the nearest epoch boundary.
 type history struct {
 	epochDuration time.Duration
-	startTime     crtime.Mono
+	startTime     time.Time
 	// currEpoch is the epoch of the most recent operation.
 	currEpoch int64
 	// val contains the recent epoch values.
@@ -160,7 +151,7 @@ const historyEpochs = 100
 
 // Init the history helper to keep track of data over the given number of
 // seconds.
-func (h *history) Init(now crtime.Mono, timeframe time.Duration) {
+func (h *history) Init(now time.Time, timeframe time.Duration) {
 	*h = history{
 		epochDuration: timeframe / time.Duration(historyEpochs),
 		startTime:     now,
@@ -170,7 +161,7 @@ func (h *history) Init(now crtime.Mono, timeframe time.Duration) {
 }
 
 // Add adds a value for the current time.
-func (h *history) Add(now crtime.Mono, val int64) {
+func (h *history) Add(now time.Time, val int64) {
 	h.advance(now)
 	h.val[h.currEpoch%historyEpochs] += val
 	h.sum += val
@@ -178,17 +169,17 @@ func (h *history) Add(now crtime.Mono, val int64) {
 
 // Sum returns the sum of recent values. The result is approximate in that the
 // cut-off time is within 1% of the exact one.
-func (h *history) Sum(now crtime.Mono) int64 {
+func (h *history) Sum(now time.Time) int64 {
 	h.advance(now)
 	return h.sum
 }
 
-func (h *history) epoch(t crtime.Mono) int64 {
+func (h *history) epoch(t time.Time) int64 {
 	return int64(t.Sub(h.startTime) / h.epochDuration)
 }
 
 // advance advances the time to the given time.
-func (h *history) advance(now crtime.Mono) {
+func (h *history) advance(now time.Time) {
 	epoch := h.epoch(now)
 	for h.currEpoch < epoch {
 		h.currEpoch++

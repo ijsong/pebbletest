@@ -52,8 +52,8 @@ package rangekey
 import (
 	"encoding/binary"
 
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
-	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 )
 
@@ -61,7 +61,7 @@ import (
 // closure with the encoded internal keys that represent the Span's state. The
 // keys and values passed to emit are only valid until the closure returns.
 // If emit returns an error, Encode stops and returns the error.
-func Encode(s keyspan.Span, emit func(k base.InternalKey, v []byte) error) error {
+func Encode(s *keyspan.Span, emit func(k base.InternalKey, v []byte) error) error {
 	enc := Encoder{Emit: emit}
 	return enc.Encode(s)
 }
@@ -82,7 +82,7 @@ type Encoder struct {
 //
 // The encoded key-value pair passed to Emit is only valid until the closure
 // completes.
-func (e *Encoder) Encode(s keyspan.Span) error {
+func (e *Encoder) Encode(s *keyspan.Span) error {
 	if s.Empty() {
 		return nil
 	}
@@ -91,7 +91,7 @@ func (e *Encoder) Encode(s keyspan.Span) error {
 	// sequence number descending, grouping them into sequence numbers. All keys
 	// with identical sequence numbers are flushed together.
 	var del bool
-	var seqNum base.SeqNum
+	var seqNum uint64
 	for i := range s.Keys {
 		if i == 0 || s.Keys[i].SeqNum() != seqNum {
 			if i > 0 {
@@ -127,7 +127,7 @@ func (e *Encoder) Encode(s keyspan.Span) error {
 
 // flush constructs internal keys for accumulated key state, and emits the
 // internal keys.
-func (e *Encoder) flush(s keyspan.Span, seqNum base.SeqNum, del bool) error {
+func (e *Encoder) flush(s *keyspan.Span, seqNum uint64, del bool) error {
 	if len(e.sets) > 0 {
 		ik := base.MakeInternalKey(s.Start, seqNum, base.InternalKeyKindRangeKeySet)
 		l := EncodedSetValueLen(s.End, e.sets)
@@ -161,59 +161,30 @@ func (e *Encoder) flush(s keyspan.Span, seqNum base.SeqNum, del bool) error {
 }
 
 // Decode takes an internal key pair encoding range key(s) and returns a decoded
-// keyspan containing the keys. If keysBuf is provided, keys will be appended to
-// it.
-func Decode(ik base.InternalKey, v []byte, keysBuf []keyspan.Key) (keyspan.Span, error) {
+// keyspan containing the keys. If keysDst is provided, keys will be appended to
+// keysDst.
+func Decode(ik base.InternalKey, v []byte, keysDst []keyspan.Key) (keyspan.Span, error) {
 	var s keyspan.Span
-	s.Start = ik.UserKey
-	var err error
-	s.End, v, err = DecodeEndKey(ik.Kind(), v)
-	if err != nil {
-		return keyspan.Span{}, err
-	}
-	s.Keys, err = appendKeys(keysBuf, ik, v)
-	if err != nil {
-		return keyspan.Span{}, err
-	}
-	return s, nil
-}
 
-// DecodeIntoSpan decodes an internal key pair encoding range key(s) and appends
-// them to the given span. The start and end keys must match those in the span.
-func DecodeIntoSpan(cmp base.Compare, ik base.InternalKey, v []byte, s *keyspan.Span) error {
 	// Hydrate the user key bounds.
-	startKey := ik.UserKey
-	endKey, v, err := DecodeEndKey(ik.Kind(), v)
-	if err != nil {
-		return err
+	s.Start = ik.UserKey
+	var ok bool
+	s.End, v, ok = DecodeEndKey(ik.Kind(), v)
+	if !ok {
+		return keyspan.Span{}, base.CorruptionErrorf("pebble: unable to decode range key end from %s", ik.Kind())
 	}
-	// This function should only be called when ik.UserKey matches the Start of
-	// the span we already have. If this is not the case, it is a bug in the
-	// calling code.
-	if invariants.Enabled && cmp(s.Start, startKey) != 0 {
-		return base.AssertionFailedf("DecodeIntoSpan called with different start key")
-	}
-	// The value can come from disk or from the user, so we want to check the end
-	// key in all builds.
-	if cmp(s.End, endKey) != 0 {
-		return base.CorruptionErrorf("pebble: corrupt range key fragmentation")
-	}
-	s.Keys, err = appendKeys(s.Keys, ik, v)
-	return err
-}
+	s.Keys = keysDst
 
-func appendKeys(buf []keyspan.Key, ik base.InternalKey, v []byte) ([]keyspan.Key, error) {
 	// Hydrate the contents of the range key(s).
 	switch ik.Kind() {
 	case base.InternalKeyKindRangeKeySet:
 		for len(v) > 0 {
 			var sv SuffixValue
-			var ok bool
 			sv, v, ok = decodeSuffixValue(v)
 			if !ok {
-				return nil, base.CorruptionErrorf("pebble: unable to decode range key suffix-value tuple")
+				return keyspan.Span{}, base.CorruptionErrorf("pebble: unable to decode range key suffix-value tuple")
 			}
-			buf = append(buf, keyspan.Key{
+			s.Keys = append(s.Keys, keyspan.Key{
 				Trailer: ik.Trailer,
 				Suffix:  sv.Suffix,
 				Value:   sv.Value,
@@ -222,25 +193,24 @@ func appendKeys(buf []keyspan.Key, ik base.InternalKey, v []byte) ([]keyspan.Key
 	case base.InternalKeyKindRangeKeyUnset:
 		for len(v) > 0 {
 			var suffix []byte
-			var ok bool
 			suffix, v, ok = decodeSuffix(v)
 			if !ok {
-				return nil, base.CorruptionErrorf("pebble: unable to decode range key unset suffix")
+				return keyspan.Span{}, base.CorruptionErrorf("pebble: unable to decode range key unset suffix")
 			}
-			buf = append(buf, keyspan.Key{
+			s.Keys = append(s.Keys, keyspan.Key{
 				Trailer: ik.Trailer,
 				Suffix:  suffix,
 			})
 		}
 	case base.InternalKeyKindRangeKeyDelete:
 		if len(v) > 0 {
-			return nil, base.CorruptionErrorf("pebble: RANGEKEYDELs must not contain additional data")
+			return keyspan.Span{}, base.CorruptionErrorf("pebble: RANGEKEYDELs must not contain additional data")
 		}
-		buf = append(buf, keyspan.Key{Trailer: ik.Trailer})
+		s.Keys = append(s.Keys, keyspan.Key{Trailer: ik.Trailer})
 	default:
-		return nil, base.CorruptionErrorf("pebble: %s is not a range key", ik.Kind())
+		return keyspan.Span{}, base.CorruptionErrorf("pebble: %s is not a range key", ik.Kind())
 	}
-	return buf, nil
+	return s, nil
 }
 
 // SuffixValue represents a tuple of a suffix and a corresponding value. A
@@ -314,23 +284,21 @@ func EncodeSetValue(dst []byte, endKey []byte, suffixValues []SuffixValue) int {
 // DecodeEndKey reads the end key from the beginning of a range key (RANGEKEYSET,
 // RANGEKEYUNSET or RANGEKEYDEL)'s physical encoded value. Both sets and unsets
 // encode the range key, plus additional data in the value.
-func DecodeEndKey(kind base.InternalKeyKind, data []byte) (endKey, value []byte, _ error) {
+func DecodeEndKey(kind base.InternalKeyKind, data []byte) (endKey, value []byte, ok bool) {
 	switch kind {
 	case base.InternalKeyKindRangeKeyDelete:
 		// No splitting is necessary for range key deletes. The value is the end
 		// key, and there is no additional associated value.
-		return data, nil, nil
-
+		return data, nil, true
 	case base.InternalKeyKindRangeKeySet, base.InternalKeyKindRangeKeyUnset:
 		v, n := binary.Uvarint(data)
 		if n <= 0 || uint64(n)+v >= uint64(len(data)) {
-			return nil, nil, base.CorruptionErrorf("pebble: unable to decode range key end from %s", kind)
+			return nil, nil, false
 		}
 		endKey, value = data[n:n+int(v)], data[n+int(v):]
-		return endKey, value, nil
-
+		return endKey, value, true
 	default:
-		return nil, nil, base.AssertionFailedf("key kind %s is not a range key kind", kind)
+		panic(errors.Newf("key kind %s is not a range key kind", kind))
 	}
 }
 

@@ -13,6 +13,7 @@
 // permissions and limitations under the License.
 
 //go:build gc && go1.9
+// +build gc,go1.9
 
 package rawalloc
 

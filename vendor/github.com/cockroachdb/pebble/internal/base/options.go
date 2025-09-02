@@ -6,10 +6,9 @@ package base
 
 // SSTable block defaults.
 const (
-	DefaultBlockRestartInterval      = 16
-	DefaultBlockSize                 = 4096
-	DefaultBlockSizeThreshold        = 90
-	SizeClassAwareBlockSizeThreshold = 60
+	DefaultBlockRestartInterval = 16
+	DefaultBlockSize            = 4096
+	DefaultBlockSizeThreshold   = 90
 )
 
 // FilterType is the level at which to apply a filter: block or table.
@@ -74,9 +73,4 @@ type BlockPropertyFilter interface {
 	// Intersects returns true if the set represented by prop intersects with
 	// the set in the filter.
 	Intersects(prop []byte) (bool, error)
-	// SyntheticSuffixIntersects runs Intersects, but only after using the passed in
-	// suffix arg to modify a decoded copy of the passed in prop. This method only
-	// needs to be implemented for filters which that will be used with suffix
-	// replacement.
-	SyntheticSuffixIntersects(prop []byte, suffix []byte) (bool, error)
 }

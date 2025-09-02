@@ -7,9 +7,3 @@ mutex.prof
 coverprofile.out
 # Testing artifacts
 meta.*.test
-
-# Bazel files, generated with 'make gen-bazel'.
-/WORKSPACE
-BUILD.bazel
-
-

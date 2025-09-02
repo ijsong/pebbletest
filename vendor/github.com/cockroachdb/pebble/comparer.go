@@ -29,6 +29,3 @@ type Comparer = base.Comparer
 
 // DefaultComparer exports the base.DefaultComparer variable.
 var DefaultComparer = base.DefaultComparer
-
-// CheckComparer exports the base.CheckComparer type.
-var CheckComparer = base.CheckComparer

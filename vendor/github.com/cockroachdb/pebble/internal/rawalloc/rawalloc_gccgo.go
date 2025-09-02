@@ -13,6 +13,7 @@
 // permissions and limitations under the License.
 
 //go:build gccgo
+// +build gccgo
 
 package rawalloc
 

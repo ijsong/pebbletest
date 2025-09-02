@@ -9,9 +9,7 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/keyspan"
-	"github.com/cockroachdb/pebble/internal/rangekey"
-	"github.com/cockroachdb/pebble/sstable/block"
-	"github.com/cockroachdb/pebble/sstable/valblk"
+	"github.com/cockroachdb/pebble/internal/manifest"
 )
 
 // VirtualReader wraps Reader. Its purpose is to restrict functionality of the
@@ -27,71 +25,80 @@ type VirtualReader struct {
 	Properties CommonProperties
 }
 
-var _ CommonReader = (*VirtualReader)(nil)
-
 // Lightweight virtual sstable state which can be passed to sstable iterators.
 type virtualState struct {
-	lower            InternalKey
-	upper            InternalKey
-	fileNum          base.FileNum
-	Compare          Compare
-	isSharedIngested bool
+	lower     InternalKey
+	upper     InternalKey
+	fileNum   base.FileNum
+	Compare   Compare
+	isForeign bool
 }
 
-// VirtualReaderParams are the parameters necessary to create a VirtualReader.
-type VirtualReaderParams struct {
-	Lower            InternalKey
-	Upper            InternalKey
-	FileNum          base.FileNum
-	IsSharedIngested bool
-	// Size is an estimate of the size of the [Lower, Upper) section of the table.
-	Size uint64
-	// BackingSize is the total size of the backing table. The ratio between Size
-	// and BackingSize is used to estimate statistics.
-	BackingSize uint64
+func ceilDiv(a, b uint64) uint64 {
+	return (a + b - 1) / b
 }
 
 // MakeVirtualReader is used to contruct a reader which can read from virtual
 // sstables.
-func MakeVirtualReader(reader *Reader, p VirtualReaderParams) VirtualReader {
-	vState := virtualState{
-		lower:            p.Lower,
-		upper:            p.Upper,
-		fileNum:          p.FileNum,
-		Compare:          reader.Comparer.Compare,
-		isSharedIngested: p.IsSharedIngested,
-	}
-	v := VirtualReader{
-		vState:     vState,
-		reader:     reader,
-		Properties: reader.Properties.GetScaledProperties(p.BackingSize, p.Size),
+func MakeVirtualReader(
+	reader *Reader, meta manifest.VirtualFileMeta, isForeign bool,
+) VirtualReader {
+	if reader.fileNum != meta.FileBacking.DiskFileNum {
+		panic("pebble: invalid call to MakeVirtualReader")
 	}
 
+	vState := virtualState{
+		lower:     meta.Smallest,
+		upper:     meta.Largest,
+		fileNum:   meta.FileNum,
+		Compare:   reader.Compare,
+		isForeign: isForeign,
+	}
+	v := VirtualReader{
+		vState: vState,
+		reader: reader,
+	}
+
+	v.Properties.RawKeySize = ceilDiv(reader.Properties.RawKeySize*meta.Size, meta.FileBacking.Size)
+	v.Properties.RawValueSize = ceilDiv(reader.Properties.RawValueSize*meta.Size, meta.FileBacking.Size)
+	v.Properties.NumEntries = ceilDiv(reader.Properties.NumEntries*meta.Size, meta.FileBacking.Size)
+	v.Properties.NumDeletions = ceilDiv(reader.Properties.NumDeletions*meta.Size, meta.FileBacking.Size)
+	v.Properties.NumRangeDeletions = ceilDiv(reader.Properties.NumRangeDeletions*meta.Size, meta.FileBacking.Size)
+	v.Properties.NumRangeKeyDels = ceilDiv(reader.Properties.NumRangeKeyDels*meta.Size, meta.FileBacking.Size)
+
+	// Note that we rely on NumRangeKeySets for correctness. If the sstable may
+	// contain range keys, then NumRangeKeySets must be > 0. ceilDiv works because
+	// meta.Size will not be 0 for virtual sstables.
+	v.Properties.NumRangeKeySets = ceilDiv(reader.Properties.NumRangeKeySets*meta.Size, meta.FileBacking.Size)
+	v.Properties.ValueBlocksSize = ceilDiv(reader.Properties.ValueBlocksSize*meta.Size, meta.FileBacking.Size)
+	v.Properties.NumSizedDeletions = ceilDiv(reader.Properties.NumSizedDeletions*meta.Size, meta.FileBacking.Size)
+	v.Properties.RawPointTombstoneKeySize = ceilDiv(reader.Properties.RawPointTombstoneKeySize*meta.Size, meta.FileBacking.Size)
+	v.Properties.RawPointTombstoneValueSize = ceilDiv(reader.Properties.RawPointTombstoneValueSize*meta.Size, meta.FileBacking.Size)
 	return v
 }
 
 // NewCompactionIter is the compaction iterator function for virtual readers.
 func (v *VirtualReader) NewCompactionIter(
-	transforms IterTransforms,
-	env block.ReadEnv,
-	rp valblk.ReaderProvider,
-	blobContext TableBlobContext,
+	bytesIterated *uint64, rp ReaderProvider, bufferPool *BufferPool,
 ) (Iterator, error) {
-	return v.reader.newCompactionIter(
-		transforms, env, rp, &v.vState, blobContext)
+	return v.reader.newCompactionIter(bytesIterated, rp, &v.vState, bufferPool)
 }
 
-// NewPointIter returns an iterator for the point keys in the table.
-//
-// If transform.HideObsoletePoints is set, the callee assumes that filterer
-// already includes obsoleteKeyBlockPropertyFilter. The caller can satisfy this
-// contract by first calling TryAddBlockPropertyFilterForHideObsoletePoints.
-//
-// We assume that the [lower, upper) bounds (if specified) will have at least
-// some overlap with the virtual sstable bounds. No overlap is not currently
-// supported in the iterator.
-func (v *VirtualReader) NewPointIter(ctx context.Context, opts IterOptions) (Iterator, error) {
-	return v.reader.newPointIter(ctx, opts, &v.vState)
+// NewIterWithBlockPropertyFiltersAndContextEtc wraps
+// Reader.NewIterWithBlockPropertyFiltersAndContext. We assume that the passed
+// in [lower, upper) bounds will have at least some overlap with the virtual
+// sstable bounds. No overlap is not currently supported in the iterator.
+func (v *VirtualReader) NewIterWithBlockPropertyFiltersAndContextEtc(
+	ctx context.Context,
+	lower, upper []byte,
+	filterer *BlockPropertiesFilterer,
+	hideObsoletePoints, useFilterBlock bool,
+	stats *base.InternalIteratorStats,
+	rp ReaderProvider,
+) (Iterator, error) {
+	return v.reader.newIterWithBlockPropertyFiltersAndContext(
+		ctx, lower, upper, filterer, hideObsoletePoints, useFilterBlock, stats, rp, &v.vState,
+	)
 }
 
 // ValidateBlockChecksumsOnBacking will call ValidateBlockChecksumsOnBacking on the underlying reader.
@@ -101,10 +108,8 @@ func (v *VirtualReader) ValidateBlockChecksumsOnBacking() error {
 }
 
 // NewRawRangeDelIter wraps Reader.NewRawRangeDelIter.
-func (v *VirtualReader) NewRawRangeDelIter(
-	ctx context.Context, transforms FragmentIterTransforms, env block.ReadEnv,
-) (keyspan.FragmentIterator, error) {
-	iter, err := v.reader.NewRawRangeDelIter(ctx, transforms, env)
+func (v *VirtualReader) NewRawRangeDelIter() (keyspan.FragmentIterator, error) {
+	iter, err := v.reader.NewRawRangeDelIter()
 	if err != nil {
 		return nil, err
 	}
@@ -112,8 +117,10 @@ func (v *VirtualReader) NewRawRangeDelIter(
 		return nil, nil
 	}
 
-	// Note that if upper is not an exclusive sentinel, Truncate will assert that
-	// there is no span that contains that key.
+	// Truncation of spans isn't allowed at a user key that also contains points
+	// in the same virtual sstable, as it would lead to covered points getting
+	// uncovered. Set panicOnUpperTruncate to true if the file's upper bound
+	// is not an exclusive sentinel.
 	//
 	// As an example, if an sstable contains a rangedel a-c and point keys at
 	// a.SET.2 and b.SET.3, the file bounds [a#2,SET-b#RANGEDELSENTINEL] are
@@ -121,23 +128,14 @@ func (v *VirtualReader) NewRawRangeDelIter(
 	// includes both point keys), but not [a#2,SET-b#3,SET] (as it would truncate
 	// the rangedel at b and lead to the point being uncovered).
 	return keyspan.Truncate(
-		v.reader.Comparer.Compare, iter,
-		base.UserKeyBoundsFromInternal(v.vState.lower, v.vState.upper),
+		v.reader.Compare, iter, v.vState.lower.UserKey, v.vState.upper.UserKey,
+		&v.vState.lower, &v.vState.upper, !v.vState.upper.IsExclusiveSentinel(), /* panicOnUpperTruncate */
 	), nil
 }
 
 // NewRawRangeKeyIter wraps Reader.NewRawRangeKeyIter.
-func (v *VirtualReader) NewRawRangeKeyIter(
-	ctx context.Context, transforms FragmentIterTransforms, env block.ReadEnv,
-) (keyspan.FragmentIterator, error) {
-	syntheticSeqNum := transforms.SyntheticSeqNum
-	if v.vState.isSharedIngested {
-		// Don't pass a synthetic sequence number for shared ingested sstables. We
-		// need to know the materialized sequence numbers, and we will set up the
-		// appropriate sequence number substitution below.
-		transforms.SyntheticSeqNum = 0
-	}
-	iter, err := v.reader.NewRawRangeKeyIter(ctx, transforms, env)
+func (v *VirtualReader) NewRawRangeKeyIter() (keyspan.FragmentIterator, error) {
+	iter, err := v.reader.NewRawRangeKeyIter()
 	if err != nil {
 		return nil, err
 	}
@@ -145,26 +143,10 @@ func (v *VirtualReader) NewRawRangeKeyIter(
 		return nil, nil
 	}
 
-	if v.vState.isSharedIngested {
-		// We need to coalesce range keys within each sstable, and then apply the
-		// synthetic sequence number. For this, we use ForeignSSTTransformer.
-		//
-		// TODO(bilal): Avoid these allocations by hoisting the transformer and
-		// transform iter into VirtualReader.
-		transform := &rangekey.ForeignSSTTransformer{
-			Equal:  v.reader.Comparer.Equal,
-			SeqNum: base.SeqNum(syntheticSeqNum),
-		}
-		transformIter := &keyspan.TransformerIter{
-			FragmentIterator: iter,
-			Transformer:      transform,
-			SuffixCmp:        v.reader.Comparer.CompareRangeSuffixes,
-		}
-		iter = transformIter
-	}
-
-	// Note that if upper is not an exclusive sentinel, Truncate will assert that
-	// there is no span that contains that key.
+	// Truncation of spans isn't allowed at a user key that also contains points
+	// in the same virtual sstable, as it would lead to covered points getting
+	// uncovered. Set panicOnUpperTruncate to true if the file's upper bound
+	// is not an exclusive sentinel.
 	//
 	// As an example, if an sstable contains a range key a-c and point keys at
 	// a.SET.2 and b.SET.3, the file bounds [a#2,SET-b#RANGEKEYSENTINEL] are
@@ -172,14 +154,9 @@ func (v *VirtualReader) NewRawRangeKeyIter(
 	// includes both point keys), but not [a#2,SET-b#3,SET] (as it would truncate
 	// the range key at b and lead to the point being uncovered).
 	return keyspan.Truncate(
-		v.reader.Comparer.Compare, iter,
-		base.UserKeyBoundsFromInternal(v.vState.lower, v.vState.upper),
+		v.reader.Compare, iter, v.vState.lower.UserKey, v.vState.upper.UserKey,
+		&v.vState.lower, &v.vState.upper, !v.vState.upper.IsExclusiveSentinel(), /* panicOnUpperTruncate */
 	), nil
-}
-
-// UnsafeReader returns the underlying *sstable.Reader behind a VirtualReader.
-func (v *VirtualReader) UnsafeReader() *Reader {
-	return v.reader
 }
 
 // Constrain bounds will narrow the start, end bounds if they do not fit within

@@ -7,24 +7,15 @@ package pebble
 import (
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
-	errorsjoin "github.com/cockroachdb/errors/join"
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/objstorage"
-	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
 )
-
-// FileNum is an identifier for a file within a database.
-type FileNum = base.FileNum
 
 // TableInfo exports the manifest.TableInfo type.
 type TableInfo = manifest.TableInfo
@@ -46,35 +37,6 @@ func formatFileNums(tables []TableInfo) string {
 		buf.WriteString(tables[i].FileNum.String())
 	}
 	return buf.String()
-}
-
-// DataCorruptionInfo contains the information for a DataCorruption event.
-type DataCorruptionInfo struct {
-	// Path of the file that is corrupted. For remote files the path starts with
-	// "remote://".
-	Path     string
-	IsRemote bool
-	// Locator is only set when IsRemote is true (note that an empty Locator is
-	// valid even then).
-	Locator remote.Locator
-	// Bounds indicates the keyspace range that is affected.
-	Bounds base.UserKeyBounds
-	// Details of the error. See cockroachdb/error for how to format with or
-	// without redaction.
-	Details error
-}
-
-func (i DataCorruptionInfo) String() string {
-	return redact.StringWithoutMarkers(i)
-}
-
-// SafeFormat implements redact.SafeFormatter.
-func (i DataCorruptionInfo) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("on-disk corruption: %s", redact.Safe(i.Path))
-	if i.IsRemote {
-		w.Printf(" (remote locator %q)", redact.Safe(i.Locator))
-	}
-	w.Printf("; bounds: %s; details: %+v", i.Bounds.String(), i.Details)
 }
 
 // LevelInfo contains info pertaining to a particular level.
@@ -116,10 +78,7 @@ type CompactionInfo struct {
 	// always ≥ Duration.
 	TotalDuration time.Duration
 	Done          bool
-	// Err is set only if Done is true. If non-nil, indicates that the compaction
-	// failed. Note that err can be ErrCancelledCompaction, which can happen
-	// during normal operation.
-	Err error
+	Err           error
 
 	SingleLevelOverlappingRatio float64
 	MultiLevelOverlappingRatio  float64
@@ -159,18 +118,14 @@ func (i CompactionInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 		w.Printf("[JOB %d] compacting(%s) ",
 			redact.Safe(i.JobID),
 			redact.SafeString(i.Reason))
-		if len(i.Annotations) > 0 {
-			w.Printf("%s ", i.Annotations)
-		}
+		w.Printf("%s", i.Annotations)
 		w.Printf("%s; ", levelInfos(i.Input))
 		w.Printf("OverlappingRatio: Single %.2f, Multi %.2f", i.SingleLevelOverlappingRatio, i.MultiLevelOverlappingRatio)
 		return
 	}
 	outputSize := tablesTotalSize(i.Output.Tables)
 	w.Printf("[JOB %d] compacted(%s) ", redact.Safe(i.JobID), redact.SafeString(i.Reason))
-	if len(i.Annotations) > 0 {
-		w.Printf("%s ", i.Annotations)
-	}
+	w.Printf("%s", i.Annotations)
 	w.Print(levelInfos(i.Input))
 	w.Printf(" -> L%d [%s] (%s), in %.1fs (%.1fs total), output rate %s/s",
 		redact.Safe(i.Output.Level),
@@ -286,58 +241,13 @@ func (i FlushInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 	}
 }
 
-// DownloadInfo contains the info for a DB.Download() event.
-type DownloadInfo struct {
-	// JobID is the ID of the download job.
-	JobID int
-
-	Spans []DownloadSpan
-
-	// Duration is the time since the operation was started.
-	Duration                    time.Duration
-	DownloadCompactionsLaunched int
-
-	// RestartCount indicates that the download operation restarted because it
-	// noticed that new external files were ingested. A DownloadBegin event with
-	// RestartCount = 0 is the start of the operation; each time we restart it we
-	// have another DownloadBegin event with RestartCount > 0.
-	RestartCount int
-	Done         bool
-	Err          error
-}
-
-func (i DownloadInfo) String() string {
-	return redact.StringWithoutMarkers(i)
-}
-
-// SafeFormat implements redact.SafeFormatter.
-func (i DownloadInfo) SafeFormat(w redact.SafePrinter, _ rune) {
-	switch {
-	case i.Err != nil:
-		w.Printf("[JOB %d] download error after %1.fs: %s", redact.Safe(i.JobID), redact.Safe(i.Duration.Seconds()), i.Err)
-
-	case i.Done:
-		w.Printf("[JOB %d] download finished in %.1fs (launched %d compactions)",
-			redact.Safe(i.JobID), redact.Safe(i.Duration.Seconds()), redact.Safe(i.DownloadCompactionsLaunched))
-
-	default:
-		if i.RestartCount == 0 {
-			w.Printf("[JOB %d] starting download for %d spans", redact.Safe(i.JobID), redact.Safe(len(i.Spans)))
-		} else {
-			w.Printf("[JOB %d] restarting download (restart #%d, time so far %.1fs, launched %d compactions)",
-				redact.Safe(i.JobID), redact.Safe(i.RestartCount), redact.Safe(i.Duration.Seconds()),
-				redact.Safe(i.DownloadCompactionsLaunched))
-		}
-	}
-}
-
 // ManifestCreateInfo contains info about a manifest creation event.
 type ManifestCreateInfo struct {
 	// JobID is the ID of the job the caused the manifest to be created.
 	JobID int
 	Path  string
 	// The file number of the new Manifest.
-	FileNum base.DiskFileNum
+	FileNum FileNum
 	Err     error
 }
 
@@ -359,7 +269,7 @@ type ManifestDeleteInfo struct {
 	// JobID is the ID of the job the caused the Manifest to be deleted.
 	JobID   int
 	Path    string
-	FileNum base.DiskFileNum
+	FileNum FileNum
 	Err     error
 }
 
@@ -383,7 +293,7 @@ type TableCreateInfo struct {
 	// "ingesting".
 	Reason  string
 	Path    string
-	FileNum base.DiskFileNum
+	FileNum FileNum
 }
 
 func (i TableCreateInfo) String() string {
@@ -400,7 +310,7 @@ func (i TableCreateInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 type TableDeleteInfo struct {
 	JobID   int
 	Path    string
-	FileNum base.DiskFileNum
+	FileNum FileNum
 	Err     error
 }
 
@@ -428,7 +338,7 @@ type TableIngestInfo struct {
 	}
 	// GlobalSeqNum is the sequence number that was assigned to all entries in
 	// the ingested table.
-	GlobalSeqNum base.SeqNum
+	GlobalSeqNum uint64
 	// flushable indicates whether the ingested sstable was treated as a
 	// flushable.
 	flushable bool
@@ -486,7 +396,7 @@ func (i TableStatsInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 // on an sstable.
 type TableValidatedInfo struct {
 	JobID int
-	Meta  *tableMetadata
+	Meta  *fileMetadata
 }
 
 func (i TableValidatedInfo) String() string {
@@ -504,10 +414,10 @@ type WALCreateInfo struct {
 	JobID int
 	Path  string
 	// The file number of the new WAL.
-	FileNum base.DiskFileNum
+	FileNum FileNum
 	// The file number of a previous WAL which was recycled to create this
 	// one. Zero if recycling did not take place.
-	RecycledFileNum base.DiskFileNum
+	RecycledFileNum FileNum
 	Err             error
 }
 
@@ -532,14 +442,11 @@ func (i WALCreateInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 }
 
 // WALDeleteInfo contains the info for a WAL deletion event.
-//
-// TODO(sumeer): extend WALDeleteInfo for the failover case in case the path
-// is insufficient to infer whether primary or secondary.
 type WALDeleteInfo struct {
 	// JobID is the ID of the job the caused the WAL to be deleted.
 	JobID   int
 	Path    string
-	FileNum base.DiskFileNum
+	FileNum FileNum
 	Err     error
 }
 
@@ -570,154 +477,6 @@ func (i WriteStallBeginInfo) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("write stall beginning: %s", redact.Safe(i.Reason))
 }
 
-// LowDiskSpaceInfo contains the information for a LowDiskSpace
-// event.
-type LowDiskSpaceInfo struct {
-	// AvailBytes is the disk space available to the current process in bytes.
-	AvailBytes uint64
-	// TotalBytes is the total disk space in bytes.
-	TotalBytes uint64
-	// PercentThreshold is one of a set of fixed percentages in the
-	// lowDiskSpaceThresholds below. This event was issued because the disk
-	// space went below this threshold.
-	PercentThreshold int
-}
-
-func (i LowDiskSpaceInfo) String() string {
-	return redact.StringWithoutMarkers(i)
-}
-
-// SafeFormat implements redact.SafeFormatter.
-func (i LowDiskSpaceInfo) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf(
-		"available disk space under %d%% (%s of %s)",
-		redact.Safe(i.PercentThreshold),
-		redact.Safe(humanize.Bytes.Uint64(i.AvailBytes)),
-		redact.Safe(humanize.Bytes.Uint64(i.TotalBytes)),
-	)
-}
-
-// PossibleAPIMisuseInfo contains the information for a PossibleAPIMisuse event.
-type PossibleAPIMisuseInfo struct {
-	Kind APIMisuseKind
-
-	// UserKey is set for the following kinds:
-	//  - IneffectualSingleDelete,
-	//  - NondeterministicSingleDelete.
-	UserKey []byte
-}
-
-func (i PossibleAPIMisuseInfo) String() string {
-	return redact.StringWithoutMarkers(i)
-}
-
-// SafeFormat implements redact.SafeFormatter.
-func (i PossibleAPIMisuseInfo) SafeFormat(w redact.SafePrinter, _ rune) {
-	switch i.Kind {
-	case IneffectualSingleDelete, NondeterministicSingleDelete:
-		w.Printf("possible API misuse: %s (key=%q)", redact.Safe(i.Kind), i.UserKey)
-	default:
-		if invariants.Enabled {
-			panic("invalid API misuse event")
-		}
-		w.Printf("invalid API misuse event")
-	}
-}
-
-// APIMisuseKind identifies the type of API misuse represented by a
-// PossibleAPIMisuse event.
-type APIMisuseKind int8
-
-const (
-	// IneffectualSingleDelete is emitted in compactions/flushes if any
-	// single delete is being elided without deleting a point set/merge.
-	//
-	// This event can sometimes be a false positive because of delete-only
-	// compactions which can cause a recent RANGEDEL to peek below an older
-	// SINGLEDEL and delete an arbitrary subset of data below that SINGLEDEL.
-	//
-	// Example:
-	//   RANGEDEL [a, c)#10 in L0
-	//   SINGLEDEL b#5 in L1
-	//   SET b#3 in L6
-	//
-	// If the L6 file containing the SET is narrow and the L1 file containing
-	// the SINGLEDEL is wide, a delete-only compaction can remove the file in
-	// L2 before the SINGLEDEL is compacted down. Then when the SINGLEDEL is
-	// compacted down, it will not find any SET to delete, resulting in the
-	// ineffectual callback.
-	IneffectualSingleDelete APIMisuseKind = iota
-
-	// NondeterministicSingleDelete is emitted in compactions/flushes if any
-	// single delete has consumed a Set/Merge, and there is another immediately
-	// older Set/SetWithDelete/Merge. The user of Pebble has violated the
-	// invariant under which SingleDelete can be used correctly.
-	//
-	// Consider the sequence SingleDelete#3, Set#2, Set#1. There are three
-	// ways some of these keys can first meet in a compaction.
-	//
-	// - All 3 keys in the same compaction: this callback will detect the
-	//   violation.
-	//
-	// - SingleDelete#3, Set#2 meet in a compaction first: Both keys will
-	//   disappear. The violation will not be detected, and the DB will have
-	//   Set#1 which is likely incorrect (from the user's perspective).
-	//
-	// - Set#2, Set#1 meet in a compaction first: The output will be Set#2,
-	//   which will later be consumed by SingleDelete#3. The violation will
-	//   not be detected and the DB will be correct.
-	//
-	// This event can sometimes be a false positive because of delete-only
-	// compactions which can cause a recent RANGEDEL to peek below an older
-	// SINGLEDEL and delete an arbitrary subset of data below that SINGLEDEL.
-	//
-	// Example:
-	//   RANGEDEL [a, z)#60 in L0
-	//   SINGLEDEL g#50 in L1
-	//   SET g#40 in L2
-	//   RANGEDEL [g,h)#30 in L3
-	//   SET g#20 in L6
-	//
-	// In this example, the two SETs represent the same user write, and the
-	// RANGEDELs are caused by the CockroachDB range being dropped. That is,
-	// the user wrote to g once, range was dropped, then added back, which
-	// caused the SET again, then at some point g was validly deleted using a
-	// SINGLEDEL, and then the range was dropped again. The older RANGEDEL can
-	// get fragmented due to compactions it has been part of. Say this L3 file
-	// containing the RANGEDEL is very narrow, while the L1, L2, L6 files are
-	// wider than the RANGEDEL in L0. Then the RANGEDEL in L3 can be dropped
-	// using a delete-only compaction, resulting in an LSM with state:
-	//
-	//   RANGEDEL [a, z)#60 in L0
-	//   SINGLEDEL g#50 in L1
-	//   SET g#40 in L2
-	//   SET g#20 in L6
-	//
-	// A multi-level compaction involving L1, L2, L6 will cause the invariant
-	// violation callback. This example doesn't need multi-level compactions:
-	// say there was a Pebble snapshot at g#21 preventing g#20 from being
-	// dropped when it meets g#40 in a compaction. That snapshot will not save
-	// RANGEDEL [g,h)#30, so we can have:
-	//
-	//   SINGLEDEL g#50 in L1
-	//   SET g#40, SET g#20 in L6
-	//
-	// And say the snapshot is removed and then the L1 and L6 compaction
-	// happens, resulting in the invariant violation callback.
-	NondeterministicSingleDelete
-)
-
-func (k APIMisuseKind) String() string {
-	switch k {
-	case IneffectualSingleDelete:
-		return "ineffectual SINGLEDEL"
-	case NondeterministicSingleDelete:
-		return "nondeterministic SINGLEDEL"
-	default:
-		return "unknown"
-	}
-}
-
 // EventListener contains a set of functions that will be invoked when various
 // significant DB events occur. Note that the functions should not run for an
 // excessive amount of time as they are invoked synchronously by the DB and may
@@ -727,10 +486,6 @@ type EventListener struct {
 	// BackgroundError is invoked whenever an error occurs during a background
 	// operation such as flush or compaction.
 	BackgroundError func(error)
-
-	// DataCorruption is invoked when an on-disk corruption is detected. It should
-	// not block, as it is called synchronously in read paths.
-	DataCorruption func(DataCorruptionInfo)
 
 	// CompactionBegin is invoked after the inputs to a compaction have been
 	// determined, but before the compaction has produced any output.
@@ -757,14 +512,6 @@ type EventListener struct {
 	// FlushEnd is invoked after a flush has complated and the result has been
 	// installed.
 	FlushEnd func(FlushInfo)
-
-	// DownloadBegin is invoked when a db.Download operation starts or restarts
-	// (restarts are caused by new external tables being ingested during the
-	// operation).
-	DownloadBegin func(DownloadInfo)
-
-	// DownloadEnd is invoked when a db.Download operation completes.
-	DownloadEnd func(DownloadInfo)
 
 	// FormatUpgrade is invoked after the database's FormatMajorVersion
 	// is upgraded.
@@ -804,13 +551,6 @@ type EventListener struct {
 
 	// WriteStallEnd is invoked when delayed writes are released.
 	WriteStallEnd func()
-
-	// LowDiskSpace is invoked periodically when the disk space is running
-	// low.
-	LowDiskSpace func(LowDiskSpaceInfo)
-
-	// PossibleAPIMisuse is invoked when a possible API misuse is detected.
-	PossibleAPIMisuse func(PossibleAPIMisuseInfo)
 }
 
 // EnsureDefaults ensures that background error events are logged to the
@@ -821,19 +561,10 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
 	if l.BackgroundError == nil {
 		if logger != nil {
 			l.BackgroundError = func(err error) {
-				logger.Errorf("background error: %s", err)
+				logger.Infof("background error: %s", err)
 			}
 		} else {
 			l.BackgroundError = func(error) {}
-		}
-	}
-	if l.DataCorruption == nil {
-		if logger != nil {
-			l.DataCorruption = func(info DataCorruptionInfo) {
-				logger.Fatalf("%s", info)
-			}
-		} else {
-			l.DataCorruption = func(info DataCorruptionInfo) {}
 		}
 	}
 	if l.CompactionBegin == nil {
@@ -850,12 +581,6 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
 	}
 	if l.FlushEnd == nil {
 		l.FlushEnd = func(info FlushInfo) {}
-	}
-	if l.DownloadBegin == nil {
-		l.DownloadBegin = func(info DownloadInfo) {}
-	}
-	if l.DownloadEnd == nil {
-		l.DownloadEnd = func(info DownloadInfo) {}
 	}
 	if l.FormatUpgrade == nil {
 		l.FormatUpgrade = func(v FormatMajorVersion) {}
@@ -893,12 +618,6 @@ func (l *EventListener) EnsureDefaults(logger Logger) {
 	if l.WriteStallEnd == nil {
 		l.WriteStallEnd = func() {}
 	}
-	if l.LowDiskSpace == nil {
-		l.LowDiskSpace = func(info LowDiskSpaceInfo) {}
-	}
-	if l.PossibleAPIMisuse == nil {
-		l.PossibleAPIMisuse = func(info PossibleAPIMisuseInfo) {}
-	}
 }
 
 // MakeLoggingEventListener creates an EventListener that logs all events to the
@@ -910,10 +629,7 @@ func MakeLoggingEventListener(logger Logger) EventListener {
 
 	return EventListener{
 		BackgroundError: func(err error) {
-			logger.Errorf("background error: %s", err)
-		},
-		DataCorruption: func(info DataCorruptionInfo) {
-			logger.Errorf("%s", info)
+			logger.Infof("background error: %s", err)
 		},
 		CompactionBegin: func(info CompactionInfo) {
 			logger.Infof("%s", info)
@@ -928,12 +644,6 @@ func MakeLoggingEventListener(logger Logger) EventListener {
 			logger.Infof("%s", info)
 		},
 		FlushEnd: func(info FlushInfo) {
-			logger.Infof("%s", info)
-		},
-		DownloadBegin: func(info DownloadInfo) {
-			logger.Infof("%s", info)
-		},
-		DownloadEnd: func(info DownloadInfo) {
 			logger.Infof("%s", info)
 		},
 		FormatUpgrade: func(v FormatMajorVersion) {
@@ -972,12 +682,6 @@ func MakeLoggingEventListener(logger Logger) EventListener {
 		WriteStallEnd: func() {
 			logger.Infof("write stall ending")
 		},
-		LowDiskSpace: func(info LowDiskSpaceInfo) {
-			logger.Infof("%s", info)
-		},
-		PossibleAPIMisuse: func(info PossibleAPIMisuseInfo) {
-			logger.Infof("%s", info)
-		},
 	}
 }
 
@@ -989,10 +693,6 @@ func TeeEventListener(a, b EventListener) EventListener {
 		BackgroundError: func(err error) {
 			a.BackgroundError(err)
 			b.BackgroundError(err)
-		},
-		DataCorruption: func(info DataCorruptionInfo) {
-			a.DataCorruption(info)
-			b.DataCorruption(info)
 		},
 		CompactionBegin: func(info CompactionInfo) {
 			a.CompactionBegin(info)
@@ -1013,14 +713,6 @@ func TeeEventListener(a, b EventListener) EventListener {
 		FlushEnd: func(info FlushInfo) {
 			a.FlushEnd(info)
 			b.FlushEnd(info)
-		},
-		DownloadBegin: func(info DownloadInfo) {
-			a.DownloadBegin(info)
-			b.DownloadBegin(info)
-		},
-		DownloadEnd: func(info DownloadInfo) {
-			a.DownloadEnd(info)
-			b.DownloadEnd(info)
 		},
 		FormatUpgrade: func(v FormatMajorVersion) {
 			a.FormatUpgrade(v)
@@ -1070,147 +762,5 @@ func TeeEventListener(a, b EventListener) EventListener {
 			a.WriteStallEnd()
 			b.WriteStallEnd()
 		},
-		LowDiskSpace: func(info LowDiskSpaceInfo) {
-			a.LowDiskSpace(info)
-			b.LowDiskSpace(info)
-		},
-		PossibleAPIMisuse: func(info PossibleAPIMisuseInfo) {
-			a.PossibleAPIMisuse(info)
-			b.PossibleAPIMisuse(info)
-		},
 	}
-}
-
-// lowDiskSpaceReporter contains the logic to report low disk space events.
-// Report is called whenever we get the disk usage statistics.
-//
-// We define a few thresholds (10%, 5%, 3%, 2%, 1%) and we post an event
-// whenever we reach a new threshold. We periodically repost the event every 30
-// minutes until we are above all thresholds.
-type lowDiskSpaceReporter struct {
-	mu struct {
-		sync.Mutex
-		lastNoticeThreshold int
-		lastNoticeTime      crtime.Mono
-	}
-}
-
-var lowDiskSpaceThresholds = []int{10, 5, 3, 2, 1}
-
-const lowDiskSpaceFrequency = 30 * time.Minute
-
-func (r *lowDiskSpaceReporter) Report(availBytes, totalBytes uint64, el *EventListener) {
-	threshold, ok := r.findThreshold(availBytes, totalBytes)
-	if !ok {
-		// Normal path.
-		return
-	}
-	if r.shouldReport(threshold, crtime.NowMono()) {
-		el.LowDiskSpace(LowDiskSpaceInfo{
-			AvailBytes:       availBytes,
-			TotalBytes:       totalBytes,
-			PercentThreshold: threshold,
-		})
-	}
-}
-
-// shouldReport returns true if we should report an event. Updates
-// lastNoticeTime/lastNoticeThreshold appropriately.
-func (r *lowDiskSpaceReporter) shouldReport(threshold int, now crtime.Mono) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if threshold < r.mu.lastNoticeThreshold || r.mu.lastNoticeTime == 0 ||
-		now.Sub(r.mu.lastNoticeTime) >= lowDiskSpaceFrequency {
-		r.mu.lastNoticeThreshold = threshold
-		r.mu.lastNoticeTime = now
-		return true
-	}
-	return false
-}
-
-// findThreshold returns the largest threshold in lowDiskSpaceThresholds which
-// is >= the percentage ratio between availBytes and totalBytes (or ok=false if
-// there is more free space than the highest threshold).
-func (r *lowDiskSpaceReporter) findThreshold(
-	availBytes, totalBytes uint64,
-) (threshold int, ok bool) {
-	// Note: in the normal path, we exit the loop during the first iteration.
-	for i, t := range lowDiskSpaceThresholds {
-		if availBytes*100 > totalBytes*uint64(lowDiskSpaceThresholds[i]) {
-			break
-		}
-		threshold = t
-		ok = true
-	}
-	return threshold, ok
-}
-
-// reportCorruption reports a corruption of a TableMetadata or BlobFileMetadata
-// to the event listener and also adds a DataCorruptionInfo payload to the error.
-func (d *DB) reportCorruption(meta any, err error) error {
-	switch meta := meta.(type) {
-	case *manifest.TableMetadata:
-		return d.reportFileCorruption(base.FileTypeTable, meta.FileBacking.DiskFileNum, meta.UserKeyBounds(), err)
-	case *manifest.BlobFileMetadata:
-		// TODO(jackson): Add bounds for blob files.
-		return d.reportFileCorruption(base.FileTypeBlob, meta.FileNum, base.UserKeyBounds{}, err)
-	default:
-		panic(fmt.Sprintf("unknown metadata type: %T", meta))
-	}
-}
-
-func (d *DB) reportFileCorruption(
-	fileType base.FileType, fileNum base.DiskFileNum, userKeyBounds base.UserKeyBounds, err error,
-) error {
-	if invariants.Enabled && !IsCorruptionError(err) {
-		panic("not a corruption error")
-	}
-
-	objMeta, lookupErr := d.objProvider.Lookup(fileType, fileNum)
-	if lookupErr != nil {
-		// If the object is not known to the provider, it must be a local object
-		// that was missing when we opened the store. Remote objects have their
-		// metadata in a catalog, so even if the backing object is deleted, the
-		// DiskFileNum would still be known.
-		objMeta = objstorage.ObjectMetadata{DiskFileNum: fileNum, FileType: fileType}
-	}
-	path := d.objProvider.Path(objMeta)
-	if objMeta.IsRemote() {
-		// Remote path (which include the locator and full path) might not always be
-		// safe.
-		err = errors.WithHintf(err, "path: %s", path)
-	} else {
-		// Local paths are safe: they start with the store directory and the
-		// filename is generated by Pebble.
-		err = errors.WithHintf(err, "path: %s", redact.Safe(path))
-	}
-	info := DataCorruptionInfo{
-		Path:     path,
-		IsRemote: objMeta.IsRemote(),
-		Locator:  objMeta.Remote.Locator,
-		Bounds:   userKeyBounds,
-		Details:  err,
-	}
-	d.opts.EventListener.DataCorruption(info)
-	// We don't use errors.Join() because that also annotates with this stack
-	// trace which would not be useful.
-	return errorsjoin.Join(err, &corruptionDetailError{info: info})
-}
-
-type corruptionDetailError struct {
-	info DataCorruptionInfo
-}
-
-func (e *corruptionDetailError) Error() string {
-	return "<corruption detail carrier>"
-}
-
-// ExtractDataCorruptionInfo extracts the DataCorruptionInfo details from a
-// corruption error. Returns nil if there is no such detail.
-func ExtractDataCorruptionInfo(err error) *DataCorruptionInfo {
-	var e *corruptionDetailError
-	if errors.As(err, &e) {
-		return &e.info
-	}
-	return nil
 }

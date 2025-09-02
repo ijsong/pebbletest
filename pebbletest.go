@@ -199,8 +199,8 @@ func main() {
 		MaxOpenFiles:                16384,
 		MemTableSize:                memTableSize,
 		MemTableStopWritesThreshold: memTableStopWritesThreshold,
-		CompactionConcurrencyRange: func() (lower int, upper int) {
-			return 1, maxConcurrentCompactions
+		MaxConcurrentCompactions: func() int {
+			return maxConcurrentCompactions
 		},
 	}
 
@@ -239,21 +239,6 @@ func main() {
 	}
 	opts.Levels[6].FilterPolicy = nil
 	opts.FlushSplitBytes = opts.Levels[0].TargetFileSize
-
-	// These size classes are a subset of available size classes in jemalloc[1].
-	// The size classes are used by Pebble for determining target block sizes for
-	// flushes, with the goal of reducing internal fragmentation. There are many
-	// more size classes that could be included, however, sstable blocks have a
-	// target block size of 32KiB, a minimum size threshold of ~19.6KiB and are
-	// unlikely to exceed 128KiB.
-	//
-	// [1] https://jemalloc.net/jemalloc.3.html#size_classes
-	opts.AllocatorSizeClasses = []int{
-		16384,
-		20480, 24576, 28672, 32768,
-		40960, 49152, 57344, 65536,
-		81920, 98304, 114688, 131072,
-	}
 
 	opts.EnsureDefaults()
 

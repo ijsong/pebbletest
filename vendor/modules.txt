@@ -1,13 +1,6 @@
 # github.com/DataDog/zstd v1.5.7
 ## explicit; go 1.14
 github.com/DataDog/zstd
-# github.com/RaduBerinde/axisds v0.0.0-20250419182453-5135a0650657
-## explicit; go 1.23
-github.com/RaduBerinde/axisds
-github.com/RaduBerinde/axisds/regiontree
-# github.com/RaduBerinde/btreemap v0.0.0-20250419174037-3d62b7205d54
-## explicit; go 1.23
-github.com/RaduBerinde/btreemap
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
@@ -17,14 +10,6 @@ github.com/cenkalti/backoff/v5
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
-# github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b
-## explicit; go 1.22
-github.com/cockroachdb/crlib/crbytes
-github.com/cockroachdb/crlib/crstrings
-github.com/cockroachdb/crlib/crsync
-github.com/cockroachdb/crlib/crtime
-github.com/cockroachdb/crlib/fifo
-github.com/cockroachdb/crlib/internal/invariants
 # github.com/cockroachdb/errors v1.11.3
 ## explicit; go 1.19
 github.com/cockroachdb/errors
@@ -46,46 +31,36 @@ github.com/cockroachdb/errors/secondary
 github.com/cockroachdb/errors/stdstrings
 github.com/cockroachdb/errors/telemetrykeys
 github.com/cockroachdb/errors/withstack
+# github.com/cockroachdb/fifo v0.0.0-20240606204812-0bbfbd93a7ce
+## explicit; go 1.20
+github.com/cockroachdb/fifo
 # github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b
 ## explicit; go 1.16
 github.com/cockroachdb/logtags
-# github.com/cockroachdb/pebble v0.0.0-20250528181608-55b3232677a3
-## explicit; go 1.23
+# github.com/cockroachdb/pebble v1.1.5
+## explicit; go 1.20
 github.com/cockroachdb/pebble
-github.com/cockroachdb/pebble/batchrepr
 github.com/cockroachdb/pebble/bloom
 github.com/cockroachdb/pebble/internal/arenaskl
 github.com/cockroachdb/pebble/internal/base
 github.com/cockroachdb/pebble/internal/batchskl
-github.com/cockroachdb/pebble/internal/binfmt
-github.com/cockroachdb/pebble/internal/buildtags
 github.com/cockroachdb/pebble/internal/bytealloc
 github.com/cockroachdb/pebble/internal/cache
-github.com/cockroachdb/pebble/internal/compact
 github.com/cockroachdb/pebble/internal/constants
 github.com/cockroachdb/pebble/internal/crc
-github.com/cockroachdb/pebble/internal/dsl
-github.com/cockroachdb/pebble/internal/genericcache
+github.com/cockroachdb/pebble/internal/fastrand
 github.com/cockroachdb/pebble/internal/humanize
 github.com/cockroachdb/pebble/internal/intern
 github.com/cockroachdb/pebble/internal/invalidating
 github.com/cockroachdb/pebble/internal/invariants
 github.com/cockroachdb/pebble/internal/keyspan
-github.com/cockroachdb/pebble/internal/keyspan/keyspanimpl
-github.com/cockroachdb/pebble/internal/lsmview
 github.com/cockroachdb/pebble/internal/manifest
 github.com/cockroachdb/pebble/internal/manual
-github.com/cockroachdb/pebble/internal/overlap
 github.com/cockroachdb/pebble/internal/private
-github.com/cockroachdb/pebble/internal/problemspans
 github.com/cockroachdb/pebble/internal/rangedel
 github.com/cockroachdb/pebble/internal/rangekey
-github.com/cockroachdb/pebble/internal/rangekeystack
 github.com/cockroachdb/pebble/internal/rawalloc
-github.com/cockroachdb/pebble/internal/sstableinternal
-github.com/cockroachdb/pebble/internal/strparse
 github.com/cockroachdb/pebble/internal/testkeys
-github.com/cockroachdb/pebble/internal/treeprinter
 github.com/cockroachdb/pebble/objstorage
 github.com/cockroachdb/pebble/objstorage/objstorageprovider
 github.com/cockroachdb/pebble/objstorage/objstorageprovider/objiotracing
@@ -95,14 +70,8 @@ github.com/cockroachdb/pebble/objstorage/remote
 github.com/cockroachdb/pebble/rangekey
 github.com/cockroachdb/pebble/record
 github.com/cockroachdb/pebble/sstable
-github.com/cockroachdb/pebble/sstable/blob
-github.com/cockroachdb/pebble/sstable/block
-github.com/cockroachdb/pebble/sstable/colblk
-github.com/cockroachdb/pebble/sstable/rowblk
-github.com/cockroachdb/pebble/sstable/valblk
 github.com/cockroachdb/pebble/vfs
 github.com/cockroachdb/pebble/vfs/atomicfs
-github.com/cockroachdb/pebble/wal
 # github.com/cockroachdb/redact v1.1.5
 ## explicit; go 1.14
 github.com/cockroachdb/redact
@@ -115,9 +84,6 @@ github.com/cockroachdb/redact/internal/markers
 github.com/cockroachdb/redact/internal/redact
 github.com/cockroachdb/redact/internal/rfmt
 github.com/cockroachdb/redact/internal/rfmt/fmtsort
-# github.com/cockroachdb/swiss v0.0.0-20250304010804-34a2c6a59016
-## explicit; go 1.21
-github.com/cockroachdb/swiss
 # github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06
 ## explicit; go 1.19
 github.com/cockroachdb/tokenbucket
@@ -164,9 +130,7 @@ github.com/klauspost/compress
 github.com/klauspost/compress/fse
 github.com/klauspost/compress/huff0
 github.com/klauspost/compress/internal/cpuinfo
-github.com/klauspost/compress/internal/race
 github.com/klauspost/compress/internal/snapref
-github.com/klauspost/compress/s2
 github.com/klauspost/compress/zstd
 github.com/klauspost/compress/zstd/internal/xxhash
 # github.com/kr/pretty v0.3.1
@@ -178,10 +142,6 @@ github.com/kr/text
 # github.com/matttproud/golang_protobuf_extensions v1.0.4
 ## explicit; go 1.9
 github.com/matttproud/golang_protobuf_extensions/pbutil
-# github.com/minio/minlz v1.0.0
-## explicit; go 1.21
-github.com/minio/minlz
-github.com/minio/minlz/internal/race
 # github.com/pkg/errors v0.9.1
 ## explicit
 github.com/pkg/errors
@@ -268,6 +228,7 @@ go.opentelemetry.io/proto/otlp/resource/v1
 # golang.org/x/exp v0.0.0-20230626212559-97b1e661b5df
 ## explicit; go 1.20
 golang.org/x/exp/constraints
+golang.org/x/exp/rand
 # golang.org/x/mod v0.24.0
 ## explicit; go 1.23.0
 golang.org/x/mod/internal/lazyregexp
