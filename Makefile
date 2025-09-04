@@ -10,7 +10,7 @@ precommit: mod fmt build mod
 
 .PHONY: build
 build:
-	${GO} build -o ./bin/pebbletest ${CURDIR}
+	${GO} build -o ./bin/pebbletest ${CURDIR}/cmd/pebbletest
 
 .PHONY: fmt
 fmt:
