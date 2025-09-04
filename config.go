@@ -18,6 +18,7 @@ type config struct {
 	batchLength          int
 	testDuration         time.Duration
 	logger               *zap.Logger
+	pprofAddr            string
 }
 
 func newConfig(opts []Option) (config, error) {
@@ -34,6 +35,9 @@ func newConfig(opts []Option) (config, error) {
 	}
 	if c.logger == nil {
 		c.logger = zap.NewNop()
+	}
+	if c.pprofAddr == "" {
+		c.pprofAddr = ":6060"
 	}
 	return c, nil
 }
@@ -115,5 +119,11 @@ func WithTestDuration(d time.Duration) Option {
 func WithLogger(logger *zap.Logger) Option {
 	return newFuncOption(func(c *config) {
 		c.logger = logger
+	})
+}
+
+func WithPprofAddr(addr string) Option {
+	return newFuncOption(func(c *config) {
+		c.pprofAddr = addr
 	})
 }
