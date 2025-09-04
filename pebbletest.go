@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 type PebbleTest struct {
@@ -30,25 +32,54 @@ func New(opts ...Option) (*PebbleTest, error) {
 		config: c,
 	}
 
+	pt.stats, err = newStats()
+	if err != nil {
+		return nil, err
+	}
+
 	pebbleOpts, err := ParseOptions(pt.dbOptions)
 	if err != nil {
 		return nil, err
 	}
-	if pt.verboseEventLogger {
-		el := pebble.MakeLoggingEventListener(&logAdaptor{
-			logger: c.logger.Sugar(),
-		})
-		pebbleOpts.EventListener = &el
-		pebbleOpts.EventListener.ManifestCreated = nil
-		pebbleOpts.EventListener.ManifestDeleted = nil
-		pebbleOpts.EventListener.TableCreated = nil
-		pebbleOpts.EventListener.TableDeleted = nil
-		pebbleOpts.EventListener.TableIngested = nil
-		pebbleOpts.EventListener.TableStatsLoaded = nil
-		pebbleOpts.EventListener.TableValidated = nil
-		pebbleOpts.EventListener.WALCreated = nil
-		pebbleOpts.EventListener.WALDeleted = nil
+
+	el := pebble.MakeLoggingEventListener(&logAdaptor{
+		logger: c.logger.Sugar(),
+	})
+	pebbleOpts.EventListener = &el
+	pebbleOpts.EventListener.ManifestCreated = nil
+	pebbleOpts.EventListener.ManifestDeleted = nil
+	pebbleOpts.EventListener.TableCreated = nil
+	pebbleOpts.EventListener.TableDeleted = nil
+	pebbleOpts.EventListener.TableIngested = nil
+	pebbleOpts.EventListener.TableStatsLoaded = nil
+	pebbleOpts.EventListener.TableValidated = nil
+	pebbleOpts.EventListener.WALCreated = nil
+	pebbleOpts.EventListener.WALDeleted = nil
+
+	if !pt.verboseEventLogger {
+		pebbleOpts.EventListener.FlushBegin = nil
+		pebbleOpts.EventListener.FlushEnd = nil
+		pebbleOpts.EventListener.CompactionBegin = nil
+		pebbleOpts.EventListener.WriteStallBegin = nil
 	}
+	compactionEndHook := el.CompactionEnd
+	pebbleOpts.EventListener.CompactionEnd = func(info pebble.CompactionInfo) {
+		if pt.verboseEventLogger {
+			compactionEndHook(info)
+		}
+		pt.stats.compactionCount.Add(context.Background(), 1, metric.WithAttributes(
+			attribute.String("reason", info.Reason),
+		))
+	}
+
+	writeStallEndHook := el.WriteStallEnd
+	pebbleOpts.EventListener.WriteStallEnd = func() {
+		if pt.verboseEventLogger {
+			writeStallEndHook()
+		}
+		pt.stats.writeStallCount.Add(context.Background(), 1)
+	}
+
 	db, err := pebble.Open(pt.dbDir, pebbleOpts)
 	if err != nil {
 		return nil, err
@@ -60,17 +91,6 @@ func New(opts ...Option) (*PebbleTest, error) {
 }
 
 func (pt *PebbleTest) Start() error {
-	closeMetricProvider, err := newMetricProvider(pt.otelAddr)
-	if err != nil {
-		return err
-	}
-	defer closeMetricProvider()
-
-	pt.stats, err = newStats()
-	if err != nil {
-		return err
-	}
-
 	var wg sync.WaitGroup
 	stopc := make(chan struct{})
 	wg.Add(1)
