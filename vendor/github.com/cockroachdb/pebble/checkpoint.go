@@ -5,11 +5,9 @@
 package pebble
 
 import (
-	"bytes"
 	"io"
 	"os"
 
-	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/record"
@@ -69,14 +67,13 @@ type CheckpointSpan struct {
 // excludeFromCheckpoint returns true if an SST file should be excluded from the
 // checkpoint because it does not overlap with the spans of interest
 // (opt.restrictToSpans).
-func excludeFromCheckpoint(f *tableMetadata, opt *checkpointOptions, cmp Compare) bool {
+func excludeFromCheckpoint(f *fileMetadata, opt *checkpointOptions, cmp Compare) bool {
 	if len(opt.restrictToSpans) == 0 {
 		// Option not set; don't exclude anything.
 		return false
 	}
 	for _, s := range opt.restrictToSpans {
-		spanBounds := base.UserKeyBoundsEndExclusive(s.Start, s.End)
-		if f.Overlaps(cmp, &spanBounds) {
+		if f.Overlaps(cmp, s.Start, s.End, true /* exclusiveEnd */) {
 			return false
 		}
 	}
@@ -135,11 +132,6 @@ func mkdirAllAndSyncParents(fs vfs.FS, destDir string) (vfs.File, error) {
 // space overhead for a checkpoint if hard links are disabled. Also beware that
 // even if hard links are used, the space overhead for the checkpoint will
 // increase over time as the DB performs compactions.
-//
-// Note that shared files in a checkpoint could get deleted if the DB is
-// restarted after a checkpoint operation, as the reference for the checkpoint
-// is only maintained in memory. This is okay as long as users of Checkpoint
-// crash shortly afterwards with a "poison file" preventing further restarts.
 func (d *DB) Checkpoint(
 	destDir string, opts ...CheckpointOption,
 ) (
@@ -185,23 +177,18 @@ func (d *DB) Checkpoint(
 	// we read, otherwise we might copy a versionEdit not reflected in the
 	// sstables we copy/link.
 	d.mu.versions.logLock()
-	// Get the the current version and the current manifest file number.
+	// Get the unflushed log files, the current version, and the current manifest
+	// file number.
+	memQueue := d.mu.mem.queue
 	current := d.mu.versions.currentVersion()
 	formatVers := d.FormatMajorVersion()
 	manifestFileNum := d.mu.versions.manifestFileNum
 	manifestSize := d.mu.versions.manifest.Size()
 	optionsFileNum := d.optionsFileNum
-
 	virtualBackingFiles := make(map[base.DiskFileNum]struct{})
-	d.mu.versions.virtualBackings.ForEach(func(backing *fileBacking) {
-		virtualBackingFiles[backing.DiskFileNum] = struct{}{}
-	})
-
-	// Acquire the logs while holding mutexes to ensure we don't race with a
-	// flush that might mark a log that's relevant to `current` as obsolete
-	// before our call to List.
-	allLogicalLogs := d.mu.log.manager.List()
-
+	for diskFileNum := range d.mu.versions.backingState.fileBackingMap {
+		virtualBackingFiles[diskFileNum] = struct{}{}
+	}
 	// Release the manifest and DB.mu so we don't block other operations on
 	// the database.
 	d.mu.versions.logUnlock()
@@ -231,10 +218,10 @@ func (d *DB) Checkpoint(
 	}
 
 	{
-		// Copy the OPTIONS.
-		srcPath := base.MakeFilepath(fs, d.dirname, base.FileTypeOptions, optionsFileNum)
+		// Link or copy the OPTIONS.
+		srcPath := base.MakeFilepath(fs, d.dirname, fileTypeOptions, optionsFileNum)
 		destPath := fs.PathJoin(destDir, fs.PathBase(srcPath))
-		ckErr = copyCheckpointOptions(fs, srcPath, destPath)
+		ckErr = vfs.LinkOrCopy(fs, srcPath, destPath)
 		if ckErr != nil {
 			return ckErr
 		}
@@ -262,8 +249,7 @@ func (d *DB) Checkpoint(
 		}
 	}
 
-	var excludedTables map[deletedFileEntry]*tableMetadata
-	var remoteFiles []base.DiskFileNum
+	var excludedFiles map[deletedFileEntry]*fileMetadata
 	// Set of FileBacking.DiskFileNum which will be required by virtual sstables
 	// in the checkpoint.
 	requiredVirtualBackingFiles := make(map[base.DiskFileNum]struct{})
@@ -272,10 +258,10 @@ func (d *DB) Checkpoint(
 		iter := current.Levels[l].Iter()
 		for f := iter.First(); f != nil; f = iter.Next() {
 			if excludeFromCheckpoint(f, opt, d.cmp) {
-				if excludedTables == nil {
-					excludedTables = make(map[deletedFileEntry]*tableMetadata)
+				if excludedFiles == nil {
+					excludedFiles = make(map[deletedFileEntry]*fileMetadata)
 				}
-				excludedTables[deletedFileEntry{
+				excludedFiles[deletedFileEntry{
 					Level:   l,
 					FileNum: f.FileNum,
 				}] = f
@@ -289,23 +275,8 @@ func (d *DB) Checkpoint(
 				}
 				requiredVirtualBackingFiles[fileBacking.DiskFileNum] = struct{}{}
 			}
-			meta, err := d.objProvider.Lookup(base.FileTypeTable, fileBacking.DiskFileNum)
-			if err != nil {
-				ckErr = err
-				return ckErr
-			}
-			if meta.IsRemote() {
-				// We don't copy remote files. This is desirable as checkpointing is
-				// supposed to be a fast operation, and references to remote files can
-				// always be resolved by any checkpoint readers by reading the object
-				// catalog. We don't add this file to excludedFiles either, as that'd
-				// cause it to be deleted in the second manifest entry which is also
-				// inaccurate.
-				remoteFiles = append(remoteFiles, meta.DiskFileNum)
-				continue
-			}
 
-			srcPath := base.MakeFilepath(fs, d.dirname, base.FileTypeTable, fileBacking.DiskFileNum)
+			srcPath := base.MakeFilepath(fs, d.dirname, fileTypeTable, fileBacking.DiskFileNum)
 			destPath := fs.PathJoin(destDir, fs.PathBase(srcPath))
 			ckErr = vfs.LinkOrCopy(fs, srcPath, destPath)
 			if ckErr != nil {
@@ -324,37 +295,26 @@ func (d *DB) Checkpoint(
 	}
 
 	ckErr = d.writeCheckpointManifest(
-		fs, formatVers, destDir, dir, manifestFileNum, manifestSize,
-		excludedTables, removeBackingTables,
+		fs, formatVers, destDir, dir, manifestFileNum.DiskFileNum(), manifestSize,
+		excludedFiles, removeBackingTables,
 	)
 	if ckErr != nil {
 		return ckErr
 	}
-	if len(remoteFiles) > 0 {
-		ckErr = d.objProvider.CheckpointState(fs, destDir, base.FileTypeTable, remoteFiles)
-		if ckErr != nil {
-			return ckErr
-		}
-	}
 
 	// Copy the WAL files. We copy rather than link because WAL file recycling
 	// will cause the WAL files to be reused which would invalidate the
-	// checkpoint. It's possible allLogicalLogs includes logs that are not
-	// relevant (beneath the version's MinUnflushedLogNum). These extra files
-	// are harmless. The earlier (wal.Manager).List call will not include
-	// obsolete logs that are sitting in the recycler or have already been
-	// passed off to the cleanup manager for deletion.
-	//
-	// TODO(jackson): It would be desirable to copy all recycling and obsolete
-	// WALs to aid corruption postmortem debugging should we need them.
-	for _, log := range allLogicalLogs {
-		for i := 0; i < log.NumSegments(); i++ {
-			srcFS, srcPath := log.SegmentLocation(i)
-			destPath := fs.PathJoin(destDir, srcFS.PathBase(srcPath))
-			ckErr = vfs.CopyAcrossFS(srcFS, srcPath, fs, destPath)
-			if ckErr != nil {
-				return ckErr
-			}
+	// checkpoint.
+	for i := range memQueue {
+		logNum := memQueue[i].logNum
+		if logNum == 0 {
+			continue
+		}
+		srcPath := base.MakeFilepath(fs, d.walDirname, fileTypeLog, logNum.DiskFileNum())
+		destPath := fs.PathJoin(destDir, fs.PathBase(srcPath))
+		ckErr = vfs.Copy(fs, srcPath, destPath)
+		if ckErr != nil {
+			return ckErr
 		}
 	}
 
@@ -368,58 +328,6 @@ func (d *DB) Checkpoint(
 	return ckErr
 }
 
-// copyCheckpointOptions copies an OPTIONS file, commenting out some options
-// that existed on the original database but no longer apply to the checkpointed
-// database. For example, the entire [WAL Failover] stanza is commented out
-// because Checkpoint will copy all WAL segment files from both the primary and
-// secondary WAL directories into the checkpoint.
-func copyCheckpointOptions(fs vfs.FS, srcPath, dstPath string) error {
-	var buf bytes.Buffer
-	f, err := fs.Open(srcPath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	// Copy the OPTIONS file verbatim, but commenting out the [WAL Failover]
-	// section.
-	err = parseOptions(string(b), parseOptionsFuncs{
-		visitNewSection: func(startOff, endOff int, section string) error {
-			if section == "WAL Failover" {
-				buf.WriteString("# ")
-			}
-			buf.Write(b[startOff:endOff])
-			return nil
-		},
-		visitKeyValue: func(startOff, endOff int, section, key, value string) error {
-			if section == "WAL Failover" {
-				buf.WriteString("# ")
-			}
-			buf.Write(b[startOff:endOff])
-			return nil
-		},
-		visitCommentOrWhitespace: func(startOff, endOff int, line string) error {
-			buf.Write(b[startOff:endOff])
-			return nil
-		},
-	})
-	if err != nil {
-		return err
-	}
-	nf, err := fs.Create(dstPath, vfs.WriteCategoryUnspecified)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(nf, &buf)
-	if err != nil {
-		return err
-	}
-	return errors.CombineErrors(nf.Sync(), nf.Close())
-}
-
 func (d *DB) writeCheckpointManifest(
 	fs vfs.FS,
 	formatVers FormatMajorVersion,
@@ -427,7 +335,7 @@ func (d *DB) writeCheckpointManifest(
 	destDir vfs.File,
 	manifestFileNum base.DiskFileNum,
 	manifestSize int64,
-	excludedTables map[deletedFileEntry]*tableMetadata,
+	excludedFiles map[deletedFileEntry]*fileMetadata,
 	removeBackingTables []base.DiskFileNum,
 ) error {
 	// Copy the MANIFEST, and create a pointer to it. We copy rather
@@ -439,7 +347,7 @@ func (d *DB) writeCheckpointManifest(
 	// If some files are excluded from the checkpoint, also append a block that
 	// records those files as deleted.
 	if err := func() error {
-		srcPath := base.MakeFilepath(fs, d.dirname, base.FileTypeManifest, manifestFileNum)
+		srcPath := base.MakeFilepath(fs, d.dirname, fileTypeManifest, manifestFileNum)
 		destPath := fs.PathJoin(destDirPath, fs.PathBase(srcPath))
 		src, err := fs.Open(srcPath, vfs.SequentialReadsOption)
 		if err != nil {
@@ -447,7 +355,7 @@ func (d *DB) writeCheckpointManifest(
 		}
 		defer src.Close()
 
-		dst, err := fs.Create(destPath, vfs.WriteCategoryUnspecified)
+		dst, err := fs.Create(destPath)
 		if err != nil {
 			return err
 		}
@@ -457,7 +365,7 @@ func (d *DB) writeCheckpointManifest(
 		// need to append another record with the excluded files (we cannot simply
 		// append a record after a raw data copy; see
 		// https://github.com/cockroachdb/cockroach/issues/100935).
-		r := record.NewReader(&io.LimitedReader{R: src, N: manifestSize}, manifestFileNum)
+		r := record.NewReader(&io.LimitedReader{R: src, N: manifestSize}, manifestFileNum.FileNum())
 		w := record.NewWriter(dst)
 		for {
 			rr, err := r.Next()
@@ -477,10 +385,10 @@ func (d *DB) writeCheckpointManifest(
 			}
 		}
 
-		if len(excludedTables) > 0 {
+		if len(excludedFiles) > 0 {
 			// Write out an additional VersionEdit that deletes the excluded SST files.
 			ve := versionEdit{
-				DeletedTables:        excludedTables,
+				DeletedFiles:         excludedFiles,
 				RemovedBackingTables: removeBackingTables,
 			}
 
@@ -500,12 +408,17 @@ func (d *DB) writeCheckpointManifest(
 		return err
 	}
 
+	// Recent format versions use an atomic marker for setting the
+	// active manifest. Older versions use the CURRENT file. The
+	// setCurrentFunc function will return a closure that will
+	// take the appropriate action for the database's format
+	// version.
 	var manifestMarker *atomicfs.Marker
 	manifestMarker, _, err := atomicfs.LocateMarker(fs, destDirPath, manifestMarkerName)
 	if err != nil {
 		return err
 	}
-	if err := manifestMarker.Move(base.MakeFilename(base.FileTypeManifest, manifestFileNum)); err != nil {
+	if err := setCurrentFunc(formatVers, manifestMarker, fs, destDirPath, destDir)(manifestFileNum.FileNum()); err != nil {
 		return err
 	}
 	return manifestMarker.Close()

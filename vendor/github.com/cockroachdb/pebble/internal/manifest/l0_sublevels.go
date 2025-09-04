@@ -6,33 +6,34 @@ package manifest
 
 import (
 	"bytes"
-	stdcmp "cmp"
 	"fmt"
 	"math"
-	"slices"
 	"sort"
 	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
-	"github.com/cockroachdb/pebble/internal/problemspans"
 )
+
+// errInvalidL0SublevelsOpt is for use in AddL0Files when the incremental
+// sublevel generation optimization failed, and NewL0Sublevels must be called.
+var errInvalidL0SublevelsOpt = errors.New("pebble: L0 sublevel generation optimization cannot be used")
 
 // Intervals are of the form [start, end) with no gap between intervals. Each
 // file overlaps perfectly with a sequence of intervals. This perfect overlap
 // occurs because the union of file boundary keys is used to pick intervals.
-// However when the largest key in a file is inclusive and it is used as an end
-// of an interval, the actual key is ImmediateSuccessor(key). We don't have the
+// However the largest key in a file is inclusive, so when it is used as
+// an interval, the actual key is ImmediateSuccessor(key). We don't have the
 // ImmediateSuccessor function to do this computation, so we instead keep an
-// isInclusiveEndBound bool to remind the code about this fact. This is used for
+// isLargest bool to remind the code about this fact. This is used for
 // comparisons in the following manner:
 // - intervalKey{k, false} < intervalKey{k, true}
 // - k1 < k2 -> intervalKey{k1, _} < intervalKey{k2, _}.
 //
 // Note that the file's largest key is exclusive if the internal key
 // has a trailer matching the rangedel sentinel key. In this case, we set
-// isInclusiveEndBound to false for end interval computation.
+// isLargest to false for end interval computation.
 //
 // For example, consider three files with bounds [a,e], [b,g], and [e,j]. The
 // interval keys produced would be intervalKey{a, false}, intervalKey{b, false},
@@ -51,19 +52,15 @@ import (
 // picking overlapping files for a compaction, only need to use the index
 // numbers and so avoid expensive byte slice comparisons.
 type intervalKey struct {
-	key                 []byte
-	isInclusiveEndBound bool
-}
-
-func (k *intervalKey) toEndBoundary() base.UserKeyBoundary {
-	return base.UserKeyExclusiveIf(k.key, !k.isInclusiveEndBound)
+	key       []byte
+	isLargest bool
 }
 
 // intervalKeyTemp is used in the sortAndSweep step. It contains additional metadata
 // which is used to generate the {min,max}IntervalIndex for files.
 type intervalKeyTemp struct {
 	intervalKey intervalKey
-	fileMeta    *TableMetadata
+	fileMeta    *FileMetadata
 	isEndKey    bool
 }
 
@@ -83,10 +80,10 @@ func (i *intervalKeyTemp) setFileIntervalIndex(idx int) {
 func intervalKeyCompare(cmp Compare, a, b intervalKey) int {
 	rv := cmp(a.key, b.key)
 	if rv == 0 {
-		if a.isInclusiveEndBound && !b.isInclusiveEndBound {
+		if a.isLargest && !b.isLargest {
 			return +1
 		}
-		if !a.isInclusiveEndBound && b.isInclusiveEndBound {
+		if !a.isLargest && b.isLargest {
 			return -1
 		}
 	}
@@ -177,7 +174,7 @@ type fileInterval struct {
 	intervalRangeIsBaseCompacting bool
 
 	// All files in this interval, in increasing sublevel order.
-	files []*TableMetadata
+	files []*FileMetadata
 
 	// len(files) - compactingFileCount is the stack depth that requires
 	// starting new compactions. This metric is not precise since the
@@ -223,7 +220,7 @@ type L0Compaction struct {
 	IsIntraL0 bool
 }
 
-// l0Sublevels represents a sublevel view of SSTables in L0. Tables in one
+// L0Sublevels represents a sublevel view of SSTables in L0. Tables in one
 // sublevel are non-overlapping in key ranges, and keys in higher-indexed
 // sublevels shadow older versions in lower-indexed sublevels. These invariants
 // are similar to the regular level invariants, except with higher indexed
@@ -232,21 +229,21 @@ type L0Compaction struct {
 // There is no limit to the number of sublevels that can exist in L0 at any
 // time, however read and compaction performance is best when there are as few
 // sublevels as possible.
-type l0Sublevels struct {
+type L0Sublevels struct {
 	// Levels are ordered from oldest sublevel to youngest sublevel in the
 	// outer slice, and the inner slice contains non-overlapping files for
 	// that sublevel in increasing key order. Levels is constructed from
 	// levelFiles and is used by callers that require a LevelSlice. The below two
-	// fields are treated as immutable once created in newL0Sublevels.
+	// fields are treated as immutable once created in NewL0Sublevels.
 	Levels     []LevelSlice
-	levelFiles [][]*TableMetadata
+	levelFiles [][]*FileMetadata
 
 	cmp       Compare
 	formatKey base.FormatKey
 
 	fileBytes uint64
 	// All the L0 files, ordered from oldest to youngest.
-	levelMetadata LevelMetadata
+	levelMetadata *LevelMetadata
 
 	// The file intervals in increasing key order.
 	orderedIntervals []fileInterval
@@ -258,27 +255,38 @@ type l0Sublevels struct {
 	addL0FilesCalled bool
 }
 
-func sortByMinIntervalIndex(files []*TableMetadata) {
-	slices.SortFunc(files, func(a, b *TableMetadata) int {
-		return stdcmp.Compare(a.minIntervalIndex, b.minIntervalIndex)
-	})
+type sublevelSorter []*FileMetadata
+
+// Len implements sort.Interface.
+func (sl sublevelSorter) Len() int {
+	return len(sl)
 }
 
-// newL0Sublevels creates an l0Sublevels instance for a given set of L0 files.
+// Less implements sort.Interface.
+func (sl sublevelSorter) Less(i, j int) bool {
+	return sl[i].minIntervalIndex < sl[j].minIntervalIndex
+}
+
+// Swap implements sort.Interface.
+func (sl sublevelSorter) Swap(i, j int) {
+	sl[i], sl[j] = sl[j], sl[i]
+}
+
+// NewL0Sublevels creates an L0Sublevels instance for a given set of L0 files.
 // These files must all be in L0 and must be sorted by seqnum (see
 // SortBySeqNum). During interval iteration, when flushSplitMaxBytes bytes are
 // exceeded in the range of intervals since the last flush split key, a flush
 // split key is added.
 //
 // This method can be called without DB.mu being held, so any DB.mu protected
-// fields in TableMetadata cannot be accessed here, such as Compacting and
+// fields in FileMetadata cannot be accessed here, such as Compacting and
 // IsIntraL0Compacting. Those fields are accessed in InitCompactingFileInfo
 // instead.
-func newL0Sublevels(
+func NewL0Sublevels(
 	levelMetadata *LevelMetadata, cmp Compare, formatKey base.FormatKey, flushSplitMaxBytes int64,
-) (*l0Sublevels, error) {
-	s := &l0Sublevels{cmp: cmp, formatKey: formatKey}
-	s.levelMetadata = *levelMetadata
+) (*L0Sublevels, error) {
+	s := &L0Sublevels{cmp: cmp, formatKey: formatKey}
+	s.levelMetadata = levelMetadata
 	keys := make([]intervalKeyTemp, 0, 2*s.levelMetadata.Len())
 	iter := levelMetadata.Iter()
 	for i, f := 0, iter.First(); f != nil; i, f = i+1, iter.Next() {
@@ -290,8 +298,8 @@ func newL0Sublevels(
 		})
 		keys = append(keys, intervalKeyTemp{
 			intervalKey: intervalKey{
-				key:                 f.Largest.UserKey,
-				isInclusiveEndBound: !f.Largest.IsExclusiveSentinel(),
+				key:       f.Largest.UserKey,
+				isLargest: !f.Largest.IsExclusiveSentinel(),
 			},
 			fileMeta: f,
 			isEndKey: true,
@@ -311,22 +319,24 @@ func newL0Sublevels(
 	// Initialize minIntervalIndex and maxIntervalIndex for each file, and use that
 	// to update intervals.
 	for f := iter.First(); f != nil; f = iter.Next() {
-		s.addFileToSublevels(f)
+		if err := s.addFileToSublevels(f, false /* checkInvariant */); err != nil {
+			return nil, err
+		}
 	}
 	// Sort each sublevel in increasing key order.
 	for i := range s.levelFiles {
-		sortByMinIntervalIndex(s.levelFiles[i])
+		sort.Sort(sublevelSorter(s.levelFiles[i]))
 	}
 
 	// Construct a parallel slice of sublevel B-Trees.
 	// TODO(jackson): Consolidate and only use the B-Trees.
 	for _, sublevelFiles := range s.levelFiles {
-		ls := makeLevelSlice(cmp, btreeCmpSmallestKey(cmp), sublevelFiles)
+		tr, ls := makeBTree(btreeCmpSmallestKey(cmp), sublevelFiles)
 		s.Levels = append(s.Levels, ls)
+		tr.Release()
 	}
 
 	s.calculateFlushSplitKeys(flushSplitMaxBytes)
-	s.Check()
 	return s, nil
 }
 
@@ -391,7 +401,7 @@ func mergeIntervals(
 				// the file bytes are interpolated over has changed.
 				estimatedBytes: 0,
 				// Copy the below attributes from prevInterval.
-				files:                         append([]*TableMetadata(nil), prevInterval.files...),
+				files:                         append([]*FileMetadata(nil), prevInterval.files...),
 				isBaseCompacting:              prevInterval.isBaseCompacting,
 				intervalRangeIsBaseCompacting: prevInterval.intervalRangeIsBaseCompacting,
 				compactingFileCount:           prevInterval.compactingFileCount,
@@ -404,78 +414,55 @@ func mergeIntervals(
 	return result, oldToNewMap
 }
 
-func (s *l0Sublevels) canUseAddL0Files(
-	addedTables map[base.FileNum]*TableMetadata, levelMetadata *LevelMetadata,
-) (filesToAddInOrder []*TableMetadata, ok bool) {
-	if s.addL0FilesCalled {
-		if invariants.Enabled {
-			panic("addL0Files called twice on the same receiver")
-		}
-		return nil, false
-	}
-	if s.levelMetadata.Len()+len(addedTables) != levelMetadata.Len() {
-		if invariants.Enabled {
-			panic("levelMetadata mismatch")
-		}
-		return nil, false
-	}
-
-	// addL0Files only works when the files we are adding match exactly the last
-	// files in the new levelMetadata (this is the case usually, but not always).
-	files := make([]*TableMetadata, len(addedTables))
-	iter := levelMetadata.Iter()
-	t := iter.Last()
-	for i := len(addedTables) - 1; i >= 0; i-- {
-		if addedTables[t.FileNum] == nil {
-			// t is an existing table that sorts after some of the new tables
-			// (specifically the ones we haven't yet seen).
-			return nil, false
-		}
-		files[i] = t
-		t = iter.Prev()
-	}
-	return files, true
-}
-
-// addL0Files incrementally builds a new l0Sublevels for when the only change
-// since the receiver l0Sublevels was an addition of the specified tables, with
+// AddL0Files incrementally builds a new L0Sublevels for when the only change
+// since the receiver L0Sublevels was an addition of the specified files, with
 // no L0 deletions. The common case of this is an ingestion or a flush. These
 // files can "sit on top" of existing sublevels, creating at most one new
 // sublevel for a flush (and possibly multiple for an ingestion), and at most
 // 2*len(files) additions to s.orderedIntervals. No files must have been deleted
 // from L0, and the added files must all be newer in sequence numbers than
-// existing files in l0Sublevels. The levelMetadata parameter corresponds to the
-// new L0 post addition of files. This method is meant to be significantly more
-// performant than newL0Sublevels.
-//
-// This function is intended to be called with the result of canUseAddL0Files(),
-// which is the list of new L0 tables in increasing L0 order.
+// existing files in L0Sublevels. The files parameter must be sorted in seqnum
+// order. The levelMetadata parameter corresponds to the new L0 post addition of
+// files. This method is meant to be significantly more performant than
+// NewL0Sublevels.
 //
 // Note that this function can only be called once on a given receiver; it
 // appends to some slices in s which is only safe when done once. This is okay,
-// as the common case (generating a new l0Sublevels after a flush/ingestion) is
+// as the common case (generating a new L0Sublevels after a flush/ingestion) is
 // only going to necessitate one call of this method on a given receiver. The
-// returned value, if non-nil, can then have [*l0Sublevels.addL0Files] called on
-// it again, and so on.
-func (s *l0Sublevels) addL0Files(
-	files []*TableMetadata, flushSplitMaxBytes int64, levelMetadata *LevelMetadata,
-) *l0Sublevels {
-	if s.addL0FilesCalled {
-		panic("addL0Files called twice on the same receiver")
+// returned value, if non-nil, can then have [*L0Sublevels.AddL0Files] called on
+// it again, and so on. If [errInvalidL0SublevelsOpt] is returned as an error,
+// it likely means the optimization could not be applied (i.e. files added were
+// older than files already in the sublevels, which is possible around
+// ingestions and in tests). Eg. it can happen when an ingested file was
+// ingested without queueing a flush since it did not actually overlap with any
+// keys in the memtable. Later on the memtable was flushed, and the memtable had
+// keys spanning around the ingested file, producing a flushed file that
+// overlapped with the ingested file in file bounds but not in keys. It's
+// possible for that flushed file to have a lower LargestSeqNum than the
+// ingested file if all the additions after the ingestion were to another
+// flushed file that was split into a separate sstable during flush. Any other
+// non-nil error means [L0Sublevels] generation failed in the same way as
+// [NewL0Sublevels] would likely fail.
+func (s *L0Sublevels) AddL0Files(
+	files []*FileMetadata, flushSplitMaxBytes int64, levelMetadata *LevelMetadata,
+) (*L0Sublevels, error) {
+	if invariants.Enabled && s.addL0FilesCalled {
+		panic("AddL0Files called twice on the same receiver")
 	}
 	s.addL0FilesCalled = true
 
 	// Start with a shallow copy of s.
-	newVal := &l0Sublevels{}
+	newVal := &L0Sublevels{}
 	*newVal = *s
 
 	newVal.addL0FilesCalled = false
-	newVal.levelMetadata = *levelMetadata
+	newVal.levelMetadata = levelMetadata
 	// Deep copy levelFiles and Levels, as they are mutated and sorted below.
 	// Shallow copies of slices that we just append to, are okay.
-	newVal.levelFiles = make([][]*TableMetadata, len(s.levelFiles))
+	newVal.levelFiles = make([][]*FileMetadata, len(s.levelFiles))
 	for i := range s.levelFiles {
-		newVal.levelFiles[i] = make([]*TableMetadata, len(s.levelFiles[i]))
+		newVal.levelFiles[i] = make([]*FileMetadata, len(s.levelFiles[i]))
 		copy(newVal.levelFiles[i], s.levelFiles[i])
 	}
 	newVal.Levels = make([]LevelSlice, len(s.Levels))
@@ -489,8 +476,8 @@ func (s *l0Sublevels) addL0Files(
 		}
 		right := intervalKeyTemp{
 			intervalKey: intervalKey{
-				key:                 f.Largest.UserKey,
-				isInclusiveEndBound: !f.Largest.IsExclusiveSentinel(),
+				key:       f.Largest.UserKey,
+				isLargest: !f.Largest.IsExclusiveSentinel(),
 			},
 			fileMeta: f,
 			isEndKey: true,
@@ -575,7 +562,7 @@ func (s *l0Sublevels) addL0Files(
 	// with a binary search, or by only looping through files to the right of
 	// the first interval touched by this method.
 	for sublevel := range s.Levels {
-		for f := range s.Levels[sublevel].All() {
+		s.Levels[sublevel].Each(func(f *FileMetadata) {
 			oldIntervalDelta := f.maxIntervalIndex - f.minIntervalIndex + 1
 			oldMinIntervalIndex := f.minIntervalIndex
 			f.minIntervalIndex = oldToNewMap[f.minIntervalIndex]
@@ -604,13 +591,15 @@ func (s *l0Sublevels) addL0Files(
 					newVal.orderedIntervals[i].estimatedBytes += f.Size / uint64(newIntervalDelta)
 				}
 			}
-		}
+		})
 	}
 	updatedSublevels := make([]int, 0)
 	// Update interval indices for new files.
 	for i, f := range files {
 		f.L0Index = s.levelMetadata.Len() + i
-		newVal.addFileToSublevels(f)
+		if err := newVal.addFileToSublevels(f, true /* checkInvariant */); err != nil {
+			return nil, err
+		}
 		updatedSublevels = append(updatedSublevels, f.SubLevel)
 	}
 
@@ -629,13 +618,13 @@ func (s *l0Sublevels) addL0Files(
 
 	// Sort each updated sublevel in increasing key order.
 	for _, sublevel := range updatedSublevels {
-		sortByMinIntervalIndex(newVal.levelFiles[sublevel])
+		sort.Sort(sublevelSorter(newVal.levelFiles[sublevel]))
 	}
 
 	// Construct a parallel slice of sublevel B-Trees.
 	// TODO(jackson): Consolidate and only use the B-Trees.
 	for _, sublevel := range updatedSublevels {
-		ls := makeLevelSlice(newVal.cmp, btreeCmpSmallestKey(newVal.cmp), newVal.levelFiles[sublevel])
+		tr, ls := makeBTree(btreeCmpSmallestKey(newVal.cmp), newVal.levelFiles[sublevel])
 		if sublevel == len(newVal.Levels) {
 			newVal.Levels = append(newVal.Levels, ls)
 		} else {
@@ -643,19 +632,21 @@ func (s *l0Sublevels) addL0Files(
 			// populated correctly.
 			newVal.Levels[sublevel] = ls
 		}
+		tr.Release()
 	}
 
 	newVal.flushSplitUserKeys = nil
 	newVal.calculateFlushSplitKeys(flushSplitMaxBytes)
-	newVal.Check()
-	return newVal
+	return newVal, nil
 }
 
-// addFileToSublevels is called during l0Sublevels generation, and adds f to the
+// addFileToSublevels is called during L0Sublevels generation, and adds f to the
 // correct sublevel's levelFiles, the relevant intervals' files slices, and sets
 // interval indices on f. This method, if called successively on multiple files,
-// _must_ be called on successively newer files (by seqnum).
-func (s *l0Sublevels) addFileToSublevels(f *TableMetadata) {
+// _must_ be called on successively newer files (by seqnum). If checkInvariant
+// is true, it could check for this in some cases and return
+// [errInvalidL0SublevelsOpt] if that invariant isn't held.
+func (s *L0Sublevels) addFileToSublevels(f *FileMetadata, checkInvariant bool) error {
 	// This is a simple and not very accurate estimate of the number of
 	// bytes this SSTable contributes to the intervals it is a part of.
 	//
@@ -668,11 +659,13 @@ func (s *l0Sublevels) addFileToSublevels(f *TableMetadata) {
 	for i := f.minIntervalIndex; i <= f.maxIntervalIndex; i++ {
 		interval := &s.orderedIntervals[i]
 		if len(interval.files) > 0 {
-			if interval.files[len(interval.files)-1].LargestSeqNum > f.LargestSeqNum {
-				panic(errors.AssertionFailedf("addFileToSublevels found existing newer file"))
+			if checkInvariant && interval.files[len(interval.files)-1].LargestSeqNum > f.LargestSeqNum {
+				// We are sliding this file "underneath" an existing file. Throw away
+				// and start over in NewL0Sublevels.
+				return errInvalidL0SublevelsOpt
 			}
 			// interval.files is sorted by sublevels, from lowest to highest.
-			// addL0Files can only add files at sublevels higher than existing files
+			// AddL0Files can only add files at sublevels higher than existing files
 			// in the same key intervals.
 			if maxSublevel := interval.files[len(interval.files)-1].SubLevel; subLevel <= maxSublevel {
 				subLevel = maxSublevel + 1
@@ -689,16 +682,17 @@ func (s *l0Sublevels) addFileToSublevels(f *TableMetadata) {
 	}
 	f.SubLevel = subLevel
 	if subLevel > len(s.levelFiles) {
-		panic(errors.AssertionFailedf("chose a sublevel beyond allowed range of sublevels: %d vs 0-%d", subLevel, len(s.levelFiles)))
+		return errors.Errorf("chose a sublevel beyond allowed range of sublevels: %d vs 0-%d", subLevel, len(s.levelFiles))
 	}
 	if subLevel == len(s.levelFiles) {
-		s.levelFiles = append(s.levelFiles, []*TableMetadata{f})
+		s.levelFiles = append(s.levelFiles, []*FileMetadata{f})
 	} else {
 		s.levelFiles[subLevel] = append(s.levelFiles[subLevel], f)
 	}
+	return nil
 }
 
-func (s *l0Sublevels) calculateFlushSplitKeys(flushSplitMaxBytes int64) {
+func (s *L0Sublevels) calculateFlushSplitKeys(flushSplitMaxBytes int64) {
 	var cumulativeBytes uint64
 	// Multiply flushSplitMaxBytes by the number of sublevels. This prevents
 	// excessive flush splitting when the number of sublevels increases.
@@ -719,21 +713,22 @@ func (s *l0Sublevels) calculateFlushSplitKeys(flushSplitMaxBytes int64) {
 // files. Must be called after sublevel initialization.
 //
 // Requires DB.mu *and* the manifest lock to be held.
-func (s *l0Sublevels) InitCompactingFileInfo(inProgress []L0Compaction) {
+func (s *L0Sublevels) InitCompactingFileInfo(inProgress []L0Compaction) {
 	for i := range s.orderedIntervals {
 		s.orderedIntervals[i].compactingFileCount = 0
 		s.orderedIntervals[i].isBaseCompacting = false
 		s.orderedIntervals[i].intervalRangeIsBaseCompacting = false
 	}
 
-	for f := range s.levelMetadata.All() {
+	iter := s.levelMetadata.Iter()
+	for f := iter.First(); f != nil; f = iter.Next() {
 		if invariants.Enabled {
 			if !bytes.Equal(s.orderedIntervals[f.minIntervalIndex].startKey.key, f.Smallest.UserKey) {
-				panic(fmt.Sprintf("f.minIntervalIndex in TableMetadata out of sync with intervals in L0Sublevels: %s != %s",
+				panic(fmt.Sprintf("f.minIntervalIndex in FileMetadata out of sync with intervals in L0Sublevels: %s != %s",
 					s.formatKey(s.orderedIntervals[f.minIntervalIndex].startKey.key), s.formatKey(f.Smallest.UserKey)))
 			}
 			if !bytes.Equal(s.orderedIntervals[f.maxIntervalIndex+1].startKey.key, f.Largest.UserKey) {
-				panic(fmt.Sprintf("f.maxIntervalIndex in TableMetadata out of sync with intervals in L0Sublevels: %s != %s",
+				panic(fmt.Sprintf("f.maxIntervalIndex in FileMetadata out of sync with intervals in L0Sublevels: %s != %s",
 					s.formatKey(s.orderedIntervals[f.maxIntervalIndex+1].startKey.key), s.formatKey(f.Smallest.UserKey)))
 			}
 		}
@@ -763,13 +758,13 @@ func (s *l0Sublevels) InitCompactingFileInfo(inProgress []L0Compaction) {
 	// were added after the compaction initiated, and the active compaction
 	// files straddle the input file. Mark these intervals as base compacting.
 	for _, c := range inProgress {
-		startIK := intervalKey{key: c.Smallest.UserKey, isInclusiveEndBound: false}
-		endIK := intervalKey{key: c.Largest.UserKey, isInclusiveEndBound: !c.Largest.IsExclusiveSentinel()}
-		start, _ := slices.BinarySearchFunc(s.orderedIntervals, startIK, func(a fileInterval, b intervalKey) int {
-			return intervalKeyCompare(s.cmp, a.startKey, b)
+		startIK := intervalKey{key: c.Smallest.UserKey, isLargest: false}
+		endIK := intervalKey{key: c.Largest.UserKey, isLargest: !c.Largest.IsExclusiveSentinel()}
+		start := sort.Search(len(s.orderedIntervals), func(i int) bool {
+			return intervalKeyCompare(s.cmp, s.orderedIntervals[i].startKey, startIK) >= 0
 		})
-		end, _ := slices.BinarySearchFunc(s.orderedIntervals, endIK, func(a fileInterval, b intervalKey) int {
-			return intervalKeyCompare(s.cmp, a.startKey, b)
+		end := sort.Search(len(s.orderedIntervals), func(i int) bool {
+			return intervalKeyCompare(s.cmp, s.orderedIntervals[i].startKey, endIK) >= 0
 		})
 		for i := start; i < end && i < len(s.orderedIntervals); i++ {
 			interval := &s.orderedIntervals[i]
@@ -795,40 +790,13 @@ func (s *l0Sublevels) InitCompactingFileInfo(inProgress []L0Compaction) {
 	}
 }
 
-// Check performs sanity checks on l0Sublevels in invariants mode.
-func (s *l0Sublevels) Check() {
-	if !invariants.Enabled {
-		return
-	}
-	iter := s.levelMetadata.Iter()
-	n := 0
-	for t := iter.First(); t != nil; n, t = n+1, iter.Next() {
-		if t.L0Index != n {
-			panic(fmt.Sprintf("t.L0Index out of sync (%d vs %d)", t.L0Index, n))
-		}
-	}
-	if len(s.Levels) != len(s.levelFiles) {
-		panic("Levels and levelFiles inconsistency")
-	}
-	for i := range s.Levels {
-		if s.Levels[i].Len() != len(s.levelFiles[i]) {
-			panic("Levels and levelFiles inconsistency")
-		}
-		for _, t := range s.levelFiles[i] {
-			if t.SubLevel != i {
-				panic("t.SubLevel out of sync")
-			}
-		}
-	}
-}
-
 // String produces a string containing useful debug information. Useful in test
 // code and debugging.
-func (s *l0Sublevels) String() string {
+func (s *L0Sublevels) String() string {
 	return s.describe(false)
 }
 
-func (s *l0Sublevels) describe(verbose bool) string {
+func (s *L0Sublevels) describe(verbose bool) string {
 	var buf strings.Builder
 	fmt.Fprintf(&buf, "file count: %d, sublevels: %d, intervals: %d\nflush split keys(%d): [",
 		s.levelMetadata.Len(), len(s.levelFiles), len(s.orderedIntervals), len(s.flushSplitUserKeys))
@@ -911,11 +879,11 @@ func (s *l0Sublevels) describe(verbose bool) string {
 	return buf.String()
 }
 
-// ReadAmplification returns the contribution of l0Sublevels to the read
+// ReadAmplification returns the contribution of L0Sublevels to the read
 // amplification for any particular point key. It is the maximum height of any
 // tracked fileInterval. This is always less than or equal to the number of
 // sublevels.
-func (s *l0Sublevels) ReadAmplification() int {
+func (s *L0Sublevels) ReadAmplification() int {
 	amp := 0
 	for i := range s.orderedIntervals {
 		interval := &s.orderedIntervals[i]
@@ -927,13 +895,19 @@ func (s *l0Sublevels) ReadAmplification() int {
 	return amp
 }
 
+// UserKeyRange encodes a key range in user key space. A UserKeyRange's Start
+// and End boundaries are both inclusive.
+type UserKeyRange struct {
+	Start, End []byte
+}
+
 // InUseKeyRanges returns the merged table bounds of L0 files overlapping the
 // provided user key range. The returned key ranges are sorted and
 // nonoverlapping.
-func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBounds {
+func (s *L0Sublevels) InUseKeyRanges(smallest, largest []byte) []UserKeyRange {
 	// Binary search to find the provided keys within the intervals.
-	startIK := intervalKey{key: smallest, isInclusiveEndBound: false}
-	endIK := intervalKey{key: largest, isInclusiveEndBound: true}
+	startIK := intervalKey{key: smallest, isLargest: false}
+	endIK := intervalKey{key: largest, isLargest: true}
 	start := sort.Search(len(s.orderedIntervals), func(i int) bool {
 		return intervalKeyCompare(s.cmp, s.orderedIntervals[i].startKey, startIK) > 0
 	})
@@ -945,8 +919,8 @@ func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBou
 		return intervalKeyCompare(s.cmp, s.orderedIntervals[i].startKey, endIK) > 0
 	})
 
-	var keyRanges []base.UserKeyBounds
-	var curr *base.UserKeyBounds
+	var keyRanges []UserKeyRange
+	var curr *UserKeyRange
 	for i := start; i < end; {
 		// Intervals with no files are not in use and can be skipped, once we
 		// end the current UserKeyRange.
@@ -958,7 +932,7 @@ func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBou
 
 		// If curr is nil, start a new in-use key range.
 		if curr == nil {
-			keyRanges = append(keyRanges, base.UserKeyBounds{
+			keyRanges = append(keyRanges, UserKeyRange{
 				Start: s.orderedIntervals[i].startKey.key,
 			})
 			curr = &keyRanges[len(keyRanges)-1]
@@ -973,7 +947,7 @@ func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBou
 			// maxIdx starts. We must set curr.End now, before making that leap,
 			// because this iteration may be the last.
 			i = maxIdx
-			curr.End = s.orderedIntervals[i+1].startKey.toEndBoundary()
+			curr.End = s.orderedIntervals[i+1].startKey.key
 			continue
 		}
 
@@ -981,7 +955,7 @@ func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBou
 		// interval. Update the current end to be the next interval's start key.
 		// Note that curr is not necessarily finished, because there may be an
 		// abutting non-empty interval.
-		curr.End = s.orderedIntervals[i+1].startKey.toEndBoundary()
+		curr.End = s.orderedIntervals[i+1].startKey.key
 		i++
 	}
 	return keyRanges
@@ -993,7 +967,7 @@ func (s *l0Sublevels) InUseKeyRanges(smallest, largest []byte) []base.UserKeyBou
 // to include in the prev sstable). These are user keys so that range tombstones
 // can be properly truncated (untruncated range tombstones are not permitted for
 // L0 files).
-func (s *l0Sublevels) FlushSplitKeys() [][]byte {
+func (s *L0Sublevels) FlushSplitKeys() [][]byte {
 	return s.flushSplitUserKeys
 }
 
@@ -1002,7 +976,7 @@ func (s *l0Sublevels) FlushSplitKeys() [][]byte {
 // picker to decide compaction score for L0. There is no scoring for intra-L0
 // compactions -- they only run if L0 score is high but we're unable to pick an
 // L0 -> Lbase compaction.
-func (s *l0Sublevels) MaxDepthAfterOngoingCompactions() int {
+func (s *L0Sublevels) MaxDepthAfterOngoingCompactions() int {
 	depth := 0
 	for i := range s.orderedIntervals {
 		interval := &s.orderedIntervals[i]
@@ -1020,7 +994,7 @@ func (s *l0Sublevels) MaxDepthAfterOngoingCompactions() int {
 // this a pure sanity checker.
 //
 //lint:ignore U1000 - useful for debugging
-func (s *l0Sublevels) checkCompaction(c *L0CompactionFiles) error {
+func (s *L0Sublevels) checkCompaction(c *L0CompactionFiles) error {
 	includedFiles := newBitSet(s.levelMetadata.Len())
 	fileIntervalsByLevel := make([]struct {
 		min int
@@ -1073,8 +1047,8 @@ func (s *l0Sublevels) checkCompaction(c *L0CompactionFiles) error {
 		if fileIntervalsByLevel[level].max > max {
 			max = fileIntervalsByLevel[level].max
 		}
-		index, _ := slices.BinarySearchFunc(s.levelFiles[level], min, func(a *TableMetadata, b int) int {
-			return stdcmp.Compare(a.maxIntervalIndex, b)
+		index := sort.Search(len(s.levelFiles[level]), func(i int) bool {
+			return s.levelFiles[level][i].maxIntervalIndex >= min
 		})
 		// start := index
 		for ; index < len(s.levelFiles[level]); index++ {
@@ -1111,17 +1085,18 @@ func (s *l0Sublevels) checkCompaction(c *L0CompactionFiles) error {
 	return nil
 }
 
-// UpdateStateForStartedCompaction updates internal l0Sublevels state for a
+// UpdateStateForStartedCompaction updates internal L0Sublevels state for a
 // recently started compaction. isBase specifies if this is a base compaction;
 // if false, this is assumed to be an intra-L0 compaction. The specified
 // compaction must be involving L0 SSTables. It's assumed that the Compacting
-// and IsIntraL0Compacting fields are already set on all [TableMetadata]s passed
+// and IsIntraL0Compacting fields are already set on all [FileMetadata]s passed
 // in.
-func (s *l0Sublevels) UpdateStateForStartedCompaction(inputs []LevelSlice, isBase bool) error {
+func (s *L0Sublevels) UpdateStateForStartedCompaction(inputs []LevelSlice, isBase bool) error {
 	minIntervalIndex := -1
 	maxIntervalIndex := 0
 	for i := range inputs {
-		for f := range inputs[i].All() {
+		iter := inputs[i].Iter()
+		for f := iter.First(); f != nil; f = iter.Next() {
 			for i := f.minIntervalIndex; i <= f.maxIntervalIndex; i++ {
 				interval := &s.orderedIntervals[i]
 				interval.compactingFileCount++
@@ -1151,7 +1126,7 @@ func (s *l0Sublevels) UpdateStateForStartedCompaction(inputs []LevelSlice, isBas
 // compaction (such as Files), as well as for picking between candidate
 // compactions (eg. fileBytes and seedIntervalStackDepthReduction).
 type L0CompactionFiles struct {
-	Files []*TableMetadata
+	Files []*FileMetadata
 
 	FilesIncluded bitSet
 	// A "seed interval" is an interval with a high stack depth that was chosen
@@ -1177,12 +1152,12 @@ type L0CompactionFiles struct {
 	// Set for intra-L0 compactions. SSTables with sequence numbers greater
 	// than earliestUnflushedSeqNum cannot be a part of intra-L0 compactions.
 	isIntraL0               bool
-	earliestUnflushedSeqNum base.SeqNum
+	earliestUnflushedSeqNum uint64
 
 	// For debugging purposes only. Used in checkCompaction().
 	preExtensionMinInterval int
 	preExtensionMaxInterval int
-	filesAdded              []*TableMetadata
+	filesAdded              []*FileMetadata
 }
 
 // Clone allocates a new L0CompactionFiles, with the same underlying data. Note
@@ -1203,7 +1178,7 @@ func (l *L0CompactionFiles) String() string {
 }
 
 // addFile adds the specified file to the LCF.
-func (l *L0CompactionFiles) addFile(f *TableMetadata) {
+func (l *L0CompactionFiles) addFile(f *FileMetadata) {
 	if l.FilesIncluded[f.L0Index] {
 		return
 	}
@@ -1394,13 +1369,9 @@ func (is intervalSorterByDecreasingScore) Swap(i, j int) {
 // heuristics, for the specified Lbase files and a minimum depth of overlapping
 // files that can be selected for compaction. Returns nil if no compaction is
 // possible.
-func (s *l0Sublevels) PickBaseCompaction(
-	logger base.Logger,
-	minCompactionDepth int,
-	baseFiles LevelSlice,
-	baseLevel int,
-	problemSpans *problemspans.ByLevel,
-) *L0CompactionFiles {
+func (s *L0Sublevels) PickBaseCompaction(
+	minCompactionDepth int, baseFiles LevelSlice,
+) (*L0CompactionFiles, error) {
 	// For LBase compactions, we consider intervals in a greedy manner in the
 	// following order:
 	// - Intervals that are unlikely to be blocked due
@@ -1415,20 +1386,11 @@ func (s *l0Sublevels) PickBaseCompaction(
 	// this cost we can eliminate this heuristic.
 	scoredIntervals := make([]intervalAndScore, 0, len(s.orderedIntervals))
 	sublevelCount := len(s.levelFiles)
-	// The last orderedInterval does not contain any files and only provides the
-	// end key for the preceding interval, so we exclude it from this iteration.
-	for i := range s.orderedIntervals[:len(s.orderedIntervals)-1] {
+	for i := range s.orderedIntervals {
 		interval := &s.orderedIntervals[i]
 		depth := len(interval.files) - interval.compactingFileCount
-		if interval.isBaseCompacting || depth < minCompactionDepth {
+		if interval.isBaseCompacting || minCompactionDepth > depth {
 			continue
-		}
-		if problemSpans != nil {
-			endKey := s.orderedIntervals[i+1].startKey
-			bounds := base.UserKeyBoundsEndExclusiveIf(interval.startKey.key, endKey.key, !endKey.isInclusiveEndBound)
-			if problemSpans.Overlaps(baseLevel, bounds) {
-				continue
-			}
 		}
 		if interval.intervalRangeIsBaseCompacting {
 			scoredIntervals = append(scoredIntervals, intervalAndScore{interval: i, score: depth})
@@ -1457,19 +1419,21 @@ func (s *l0Sublevels) PickBaseCompaction(
 		// file since they are likely nearby. Note that it is possible that
 		// those intervals have seed files at lower sub-levels so could be
 		// viable for compaction.
+		if f == nil {
+			return nil, errors.New("no seed file found in sublevel intervals")
+		}
 		consideredIntervals.markBits(f.minIntervalIndex, f.maxIntervalIndex+1)
 		if f.IsCompacting() {
 			if f.IsIntraL0Compacting {
 				// If we're picking a base compaction and we came across a seed
 				// file candidate that's being intra-L0 compacted, skip the
-				// interval instead of emitting an error.
+				// interval instead of erroring out.
 				continue
 			}
-			// We chose a compaction seed file that should not be compacting; this
-			// indicates that the the internal state is inconsistent. Note that
-			// base.AssertionFailedf panics in invariant builds.
-			logger.Errorf("%v", base.AssertionFailedf("seed file %s should not be compacting", f.FileNum))
-			continue
+			// We chose a compaction seed file that should not be compacting.
+			// Usually means the score is not accurately accounting for files
+			// already compacting, or internal state is inconsistent.
+			return nil, errors.Errorf("file %s chosen as seed file for compaction should not be compacting", f.FileNum)
 		}
 
 		c := s.baseCompactionUsingSeed(f, interval.index, minCompactionDepth)
@@ -1487,7 +1451,7 @@ func (s *l0Sublevels) PickBaseCompaction(
 			for ; m != nil && !baseCompacting; m = baseIter.Next() {
 				cmp := s.cmp(m.Smallest.UserKey, s.orderedIntervals[c.maxIntervalIndex+1].startKey.key)
 				// Compaction is ending at exclusive bound of c.maxIntervalIndex+1
-				if cmp > 0 || (cmp == 0 && !s.orderedIntervals[c.maxIntervalIndex+1].startKey.isInclusiveEndBound) {
+				if cmp > 0 || (cmp == 0 && !s.orderedIntervals[c.maxIntervalIndex+1].startKey.isLargest) {
 					break
 				}
 				baseCompacting = baseCompacting || m.IsCompacting()
@@ -1495,16 +1459,16 @@ func (s *l0Sublevels) PickBaseCompaction(
 			if baseCompacting {
 				continue
 			}
-			return c
+			return c, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 // Helper function for building an L0 -> Lbase compaction using a seed interval
 // and seed file in that seed interval.
-func (s *l0Sublevels) baseCompactionUsingSeed(
-	f *TableMetadata, intervalIndex int, minCompactionDepth int,
+func (s *L0Sublevels) baseCompactionUsingSeed(
+	f *FileMetadata, intervalIndex int, minCompactionDepth int,
 ) *L0CompactionFiles {
 	c := &L0CompactionFiles{
 		FilesIncluded:        newBitSet(s.levelMetadata.Len()),
@@ -1598,11 +1562,11 @@ func (s *l0Sublevels) baseCompactionUsingSeed(
 // include overlapping files in the specified sublevel. Returns true if the
 // compaction is possible (i.e. does not conflict with any base/intra-L0
 // compacting files).
-func (s *l0Sublevels) extendFiles(
-	sl int, earliestUnflushedSeqNum base.SeqNum, cFiles *L0CompactionFiles,
+func (s *L0Sublevels) extendFiles(
+	sl int, earliestUnflushedSeqNum uint64, cFiles *L0CompactionFiles,
 ) bool {
-	index, _ := slices.BinarySearchFunc(s.levelFiles[sl], cFiles.minIntervalIndex, func(a *TableMetadata, b int) int {
-		return stdcmp.Compare(a.maxIntervalIndex, b)
+	index := sort.Search(len(s.levelFiles[sl]), func(i int) bool {
+		return s.levelFiles[sl][i].maxIntervalIndex >= cFiles.minIntervalIndex
 	})
 	for ; index < len(s.levelFiles[sl]); index++ {
 		f := s.levelFiles[sl][index]
@@ -1630,24 +1594,15 @@ func (s *l0Sublevels) extendFiles(
 // sublevel. This method is only called when a base compaction cannot be chosen.
 // See comment above [PickBaseCompaction] for heuristics involved in this
 // selection.
-func (s *l0Sublevels) PickIntraL0Compaction(
-	earliestUnflushedSeqNum base.SeqNum, minCompactionDepth int, problemSpans *problemspans.ByLevel,
-) *L0CompactionFiles {
+func (s *L0Sublevels) PickIntraL0Compaction(
+	earliestUnflushedSeqNum uint64, minCompactionDepth int,
+) (*L0CompactionFiles, error) {
 	scoredIntervals := make([]intervalAndScore, len(s.orderedIntervals))
-	// The last orderedInterval does not contain any files and only provides the
-	// end key for the preceding interval, so we exclude it from this iteration.
-	for i := range s.orderedIntervals[:len(s.orderedIntervals)-1] {
+	for i := range s.orderedIntervals {
 		interval := &s.orderedIntervals[i]
 		depth := len(interval.files) - interval.compactingFileCount
 		if minCompactionDepth > depth {
 			continue
-		}
-		if problemSpans != nil {
-			endKey := s.orderedIntervals[i+1].startKey
-			bounds := base.UserKeyBoundsEndExclusiveIf(interval.startKey.key, endKey.key, !endKey.isInclusiveEndBound)
-			if problemSpans.Overlaps(0, bounds) {
-				continue
-			}
 		}
 		scoredIntervals[i] = intervalAndScore{interval: i, score: depth}
 	}
@@ -1662,48 +1617,53 @@ func (s *l0Sublevels) PickIntraL0Compaction(
 			continue
 		}
 
+		var f *FileMetadata
 		// Pick the seed file for the interval as the file in the highest
 		// sub-level.
-		seedFile := func() *TableMetadata {
-			stackDepthReduction := scoredInterval.score
-			for i := len(interval.files) - 1; i >= 0; i-- {
-				f := interval.files[i]
-				if f.IsCompacting() {
-					// This file could be in a concurrent intra-L0 or base compaction; we
-					// can't use this interval.
-					return nil
-				}
-				consideredIntervals.markBits(f.minIntervalIndex, f.maxIntervalIndex+1)
-				// Can this be the seed file? Files with newer sequence numbers than
-				// earliestUnflushedSeqNum cannot be in the compaction.
-				if f.LargestSeqNum < earliestUnflushedSeqNum {
-					return f
-				}
-				stackDepthReduction--
-				if stackDepthReduction < minCompactionDepth {
-					// Can't use this interval.
-					return nil
-				}
+		stackDepthReduction := scoredInterval.score
+		for i := len(interval.files) - 1; i >= 0; i-- {
+			f = interval.files[i]
+			if f.IsCompacting() {
+				break
 			}
-			return nil
-		}()
-		if seedFile == nil {
+			consideredIntervals.markBits(f.minIntervalIndex, f.maxIntervalIndex+1)
+			// Can this be the seed file? Files with newer sequence numbers than
+			// earliestUnflushedSeqNum cannot be in the compaction.
+			if f.LargestSeqNum >= earliestUnflushedSeqNum {
+				stackDepthReduction--
+				if stackDepthReduction == 0 {
+					break
+				}
+			} else {
+				break
+			}
+		}
+		if stackDepthReduction < minCompactionDepth {
+			// Can't use this interval.
+			continue
+		}
+
+		if f == nil {
+			return nil, errors.New("no seed file found in sublevel intervals")
+		}
+		if f.IsCompacting() {
+			// This file could be in a concurrent intra-L0 or base compaction.
 			// Try another interval.
 			continue
 		}
 
 		// We have a seed file. Build a compaction off of that seed.
 		c := s.intraL0CompactionUsingSeed(
-			seedFile, interval.index, earliestUnflushedSeqNum, minCompactionDepth)
+			f, interval.index, earliestUnflushedSeqNum, minCompactionDepth)
 		if c != nil {
-			return c
+			return c, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
-func (s *l0Sublevels) intraL0CompactionUsingSeed(
-	f *TableMetadata, intervalIndex int, earliestUnflushedSeqNum base.SeqNum, minCompactionDepth int,
+func (s *L0Sublevels) intraL0CompactionUsingSeed(
+	f *FileMetadata, intervalIndex int, earliestUnflushedSeqNum uint64, minCompactionDepth int,
 ) *L0CompactionFiles {
 	// We know that all the files that overlap with intervalIndex have
 	// LargestSeqNum < earliestUnflushedSeqNum, but for other intervals
@@ -1802,7 +1762,7 @@ func (s *l0Sublevels) intraL0CompactionUsingSeed(
 // including any user keys for those internal keys could require choosing more
 // files in LBase which is undesirable. Unbounded start/end keys are indicated
 // by passing in the InvalidInternalKey.
-func (s *l0Sublevels) ExtendL0ForBaseCompactionTo(
+func (s *L0Sublevels) ExtendL0ForBaseCompactionTo(
 	smallest, largest InternalKey, candidate *L0CompactionFiles,
 ) bool {
 	firstIntervalIndex := 0
@@ -1920,7 +1880,7 @@ func (s *l0Sublevels) ExtendL0ForBaseCompactionTo(
 //
 // TODO(bilal): Add more targeted tests for this method, through
 // ExtendL0ForBaseCompactionTo and intraL0CompactionUsingSeed.
-func (s *l0Sublevels) extendCandidateToRectangle(
+func (s *L0Sublevels) extendCandidateToRectangle(
 	minIntervalIndex int, maxIntervalIndex int, candidate *L0CompactionFiles, isBase bool,
 ) bool {
 	candidate.preExtensionMinInterval = candidate.minIntervalIndex
@@ -2077,200 +2037,4 @@ func (s *l0Sublevels) extendCandidateToRectangle(
 		}
 	}
 	return addedCount > 0
-}
-
-// L0Organizer keeps track of L0 state, including the subdivision into
-// sublevels.
-//
-// It is designed to be used as a singleton (per DB) which gets updated as
-// the version changes. It is used to initialize L0-related Version fields.
-//
-// The level 0 sstables are organized in a series of sublevels. Similar to the
-// seqnum invariant in normal levels, there is no internal key in a lower
-// sublevel table that has both the same user key and a higher sequence number.
-// Within a sublevel, tables are sorted by their internal key range and any two
-// tables at the same sublevel do not overlap. Unlike the normal levels,
-// sublevel n contains older tables (lower sequence numbers) than sublevel n+1
-// (this is because the number of sublevels is variable).
-type L0Organizer struct {
-	cmp             base.Compare
-	formatKey       base.FormatKey
-	flushSplitBytes int64
-	generation      int64
-
-	// levelMetadata is the current L0.
-	levelMetadata LevelMetadata
-
-	// l0Sublevels reflects the current L0.
-	*l0Sublevels
-}
-
-// NewL0Organizer creates the L0 organizer. The L0 organizer is responsible for
-// maintaining the current L0 state and is kept in-sync with the current Version.
-//
-// flushSplitBytes denotes the target number of bytes per sublevel in each flush
-// split interval (i.e. range between two flush split keys) in L0 sstables. When
-// set to zero, only a single sstable is generated by each flush. When set to a
-// non-zero value, flushes are split at points to meet L0's TargetFileSize, any
-// grandparent-related overlap options, and at boundary keys of L0 flush split
-// intervals (which are targeted to contain around FlushSplitBytes bytes in each
-// sublevel between pairs of boundary keys). Splitting sstables during flush
-// allows increased compaction flexibility and concurrency when those tables are
-// compacted to lower levels.
-func NewL0Organizer(comparer *base.Comparer, flushSplitBytes int64) *L0Organizer {
-	o := &L0Organizer{
-		cmp:             comparer.Compare,
-		formatKey:       comparer.FormatKey,
-		flushSplitBytes: flushSplitBytes,
-		levelMetadata:   MakeLevelMetadata(comparer.Compare, 0, nil),
-	}
-	var err error
-	o.l0Sublevels, err = newL0Sublevels(&o.levelMetadata, o.cmp, o.formatKey, o.flushSplitBytes)
-	if err != nil {
-		panic(errors.AssertionFailedf("error generating empty L0Sublevels: %s", err))
-	}
-	return o
-}
-
-// PrepareUpdate is the first step in the two-step process to update the
-// L0Organizer. This first step performs as much work as it can without
-// modifying the L0Organizer.
-//
-// This method can be called concurrently with other methods (other than
-// PerformUpdate). It allows doing most of the update work outside an important
-// lock.
-func (o *L0Organizer) PrepareUpdate(bve *BulkVersionEdit, newVersion *Version) L0PreparedUpdate {
-	addedL0Tables := bve.AddedTables[0]
-	deletedL0Tables := bve.DeletedTables[0]
-	newLevelMeta := &newVersion.Levels[0]
-	if invariants.Enabled && invariants.Sometimes(10) {
-		// Verify that newLevelMeta = m.levelMetadata + addedL0Tables - deletedL0Tables.
-		verifyLevelMetadataTransition(&o.levelMetadata, newLevelMeta, addedL0Tables, deletedL0Tables)
-	}
-
-	if len(addedL0Tables) == 0 && len(deletedL0Tables) == 0 {
-		return L0PreparedUpdate{
-			generation:   o.generation,
-			newSublevels: o.l0Sublevels,
-		}
-	}
-
-	if len(deletedL0Tables) == 0 {
-		if files, ok := o.l0Sublevels.canUseAddL0Files(addedL0Tables, newLevelMeta); ok {
-			return L0PreparedUpdate{
-				generation: o.generation,
-				addL0Files: files,
-			}
-		}
-	}
-	newSublevels, err := newL0Sublevels(newLevelMeta, o.cmp, o.formatKey, o.flushSplitBytes)
-	if err != nil {
-		panic(errors.AssertionFailedf("error generating L0Sublevels: %s", err))
-	}
-
-	return L0PreparedUpdate{
-		generation:   o.generation,
-		newSublevels: newSublevels,
-	}
-}
-
-// L0PreparedUpdate is returned by L0Organizer.PrepareUpdate(), to be passed to
-// PerformUpdate().
-type L0PreparedUpdate struct {
-	generation int64
-
-	// Exactly one of the following fields will be set.
-	addL0Files   []*TableMetadata
-	newSublevels *l0Sublevels
-}
-
-// PerformUpdate applies an update the L0 organizer which was previously
-// prepared using PrepareUpdate.
-//
-// Sets newVersion.L0SublevelFiles (which is immutable once set).
-//
-// This method cannot be called concurrently with any other methods.
-func (o *L0Organizer) PerformUpdate(prepared L0PreparedUpdate, newVersion *Version) {
-	if prepared.generation != o.generation {
-		panic("invalid L0 update generation")
-	}
-	o.levelMetadata = newVersion.Levels[0]
-	o.generation++
-	if prepared.addL0Files != nil {
-		newSublevels := o.l0Sublevels.addL0Files(prepared.addL0Files, o.flushSplitBytes, &o.levelMetadata)
-		// In invariants mode, sometimes rebuild from scratch to verify that
-		// AddL0Files did the right thing. Note that NewL0Sublevels updates
-		// fields in TableMetadata like L0Index, so we don't want to do this
-		// every time.
-		if invariants.Enabled && invariants.Sometimes(10) {
-			expectedSublevels, err := newL0Sublevels(&o.levelMetadata, o.cmp, o.formatKey, o.flushSplitBytes)
-			if err != nil {
-				panic(fmt.Sprintf("error when regenerating sublevels: %s", err))
-			}
-			s1 := describeSublevels(o.formatKey, false /* verbose */, expectedSublevels.Levels)
-			s2 := describeSublevels(o.formatKey, false /* verbose */, newSublevels.Levels)
-			if s1 != s2 {
-				// Add verbosity.
-				s1 := describeSublevels(o.formatKey, true /* verbose */, expectedSublevels.Levels)
-				s2 := describeSublevels(o.formatKey, true /* verbose */, newSublevels.Levels)
-				panic(fmt.Sprintf("incremental L0 sublevel generation produced different output than regeneration: %s != %s", s1, s2))
-			}
-		}
-		o.l0Sublevels = newSublevels
-	} else {
-		o.l0Sublevels = prepared.newSublevels
-	}
-	newVersion.L0SublevelFiles = o.l0Sublevels.Levels
-}
-
-// ResetForTesting reinitializes the L0Organizer to reflect the given version.
-// Sets v.L0SublevelFiles.
-func (o *L0Organizer) ResetForTesting(v *Version) {
-	o.levelMetadata = v.Levels[0]
-	o.generation = 0
-	var err error
-	o.l0Sublevels, err = newL0Sublevels(&v.Levels[0], o.cmp, o.formatKey, o.flushSplitBytes)
-	if err != nil {
-		panic(errors.AssertionFailedf("error generating L0Sublevels: %s", err))
-	}
-	v.L0SublevelFiles = o.l0Sublevels.Levels
-}
-
-// verifyLevelMetadataTransition verifies that newLevel matches oldLevel after
-// adding and removing the specified tables.
-func verifyLevelMetadataTransition(
-	oldLevel, newLevel *LevelMetadata,
-	addedTables map[base.FileNum]*TableMetadata,
-	deletedTables map[base.FileNum]*TableMetadata,
-) {
-	m := make(map[base.FileNum]*TableMetadata, oldLevel.Len())
-	iter := oldLevel.Iter()
-	for t := iter.First(); t != nil; t = iter.Next() {
-		m[t.FileNum] = t
-	}
-	for n, t := range addedTables {
-		if m[n] != nil {
-			panic("added table that already exists in old level")
-		}
-		m[n] = t
-	}
-	for n, t := range deletedTables {
-		if m[n] == nil {
-			panic("deleted table not in old level")
-		}
-		if m[n] != t {
-			panic("deleted table does not match old level")
-		}
-		delete(m, n)
-	}
-	iter = newLevel.Iter()
-	for t := iter.First(); t != nil; t = iter.Next() {
-		if m[t.FileNum] == nil {
-			panic("unknown table in new level")
-		}
-		delete(m, t.FileNum)
-	}
-	if len(m) != 0 {
-		panic("tables missing from the new level")
-	}
 }

@@ -5,19 +5,18 @@
 package invalidating
 
 import (
-	"context"
-	"slices"
-
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/fastrand"
 	"github.com/cockroachdb/pebble/internal/invariants"
-	"github.com/cockroachdb/pebble/internal/treeprinter"
 )
 
 // MaybeWrapIfInvariants wraps some iterators with an invalidating iterator.
 // MaybeWrapIfInvariants does nothing in non-invariant builds.
 func MaybeWrapIfInvariants(iter base.InternalIterator) base.InternalIterator {
-	if invariants.Enabled && invariants.Sometimes(10) {
-		return NewIter(iter)
+	if invariants.Enabled {
+		if fastrand.Uint32n(10) == 1 {
+			return NewIter(iter)
+		}
 	}
 	return iter
 }
@@ -26,7 +25,8 @@ func MaybeWrapIfInvariants(iter base.InternalIterator) base.InternalIterator {
 // returned key/value to all 1s.
 type iter struct {
 	iter        base.InternalIterator
-	lastKV      *base.InternalKV
+	lastKey     *base.InternalKey
+	lastValue   base.LazyValue
 	ignoreKinds [base.InternalKeyKindMax + 1]bool
 	err         error
 }
@@ -53,7 +53,7 @@ func IgnoreKinds(kinds ...base.InternalKeyKind) Option {
 
 // NewIter constructs a new invalidating iterator that wraps the provided
 // iterator, trashing buffers for previously returned keys.
-func NewIter(originalIterator base.InternalIterator, opts ...Option) base.TopLevelIterator {
+func NewIter(originalIterator base.InternalIterator, opts ...Option) base.InternalIterator {
 	i := &iter{iter: originalIterator}
 	for _, opt := range opts {
 		opt.apply(i)
@@ -61,87 +61,84 @@ func NewIter(originalIterator base.InternalIterator, opts ...Option) base.TopLev
 	return i
 }
 
-func (i *iter) update(kv *base.InternalKV) *base.InternalKV {
+func (i *iter) update(
+	key *base.InternalKey, value base.LazyValue,
+) (*base.InternalKey, base.LazyValue) {
 	i.trashLastKV()
-	if kv == nil {
-		i.lastKV = nil
-		return nil
+	if key == nil {
+		i.lastKey = nil
+		i.lastValue = base.LazyValue{}
+		return nil, base.LazyValue{}
 	}
 
-	lv := kv.LazyValue()
-	copiedLV := base.LazyValue{
-		ValueOrHandle: slices.Clone(lv.ValueOrHandle),
+	i.lastKey = &base.InternalKey{}
+	*i.lastKey = key.Clone()
+	i.lastValue = base.LazyValue{
+		ValueOrHandle: append(make([]byte, 0, len(value.ValueOrHandle)), value.ValueOrHandle...),
 	}
-	if lv.Fetcher != nil {
+	if value.Fetcher != nil {
 		fetcher := new(base.LazyFetcher)
-		*fetcher = *lv.Fetcher
-		copiedLV.Fetcher = fetcher
+		*fetcher = *value.Fetcher
+		i.lastValue.Fetcher = fetcher
 	}
-	i.lastKV = &base.InternalKV{
-		K: kv.K.Clone(),
-		V: base.MakeLazyValue(copiedLV),
-	}
-	return i.lastKV
+	return i.lastKey, i.lastValue
 }
 
 func (i *iter) trashLastKV() {
-	if i.lastKV == nil {
+	if i.lastKey == nil {
 		return
 	}
-	if i.ignoreKinds[i.lastKV.Kind()] {
+	if i.ignoreKinds[i.lastKey.Kind()] {
 		return
 	}
 
-	if i.lastKV != nil {
-		for j := range i.lastKV.K.UserKey {
-			i.lastKV.K.UserKey[j] = 0xff
+	if i.lastKey != nil {
+		for j := range i.lastKey.UserKey {
+			i.lastKey.UserKey[j] = 0xff
 		}
-		i.lastKV.K.Trailer = 0xffffffffffffffff
+		i.lastKey.Trailer = 0xffffffffffffffff
 	}
-	lv := i.lastKV.LazyValue()
-	for j := range lv.ValueOrHandle {
-		lv.ValueOrHandle[j] = 0xff
+	for j := range i.lastValue.ValueOrHandle {
+		i.lastValue.ValueOrHandle[j] = 0xff
 	}
-	if lv.Fetcher != nil {
+	if i.lastValue.Fetcher != nil {
 		// Not all the LazyFetcher fields are visible, so we zero out the last
 		// value's Fetcher struct entirely.
-		*lv.Fetcher = base.LazyFetcher{}
+		*i.lastValue.Fetcher = base.LazyFetcher{}
 	}
 }
 
-func (i *iter) SeekGE(key []byte, flags base.SeekGEFlags) *base.InternalKV {
+func (i *iter) SeekGE(key []byte, flags base.SeekGEFlags) (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.SeekGE(key, flags))
 }
 
-func (i *iter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
+func (i *iter) SeekPrefixGE(
+	prefix, key []byte, flags base.SeekGEFlags,
+) (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.SeekPrefixGE(prefix, key, flags))
 }
 
-func (i *iter) SeekPrefixGEStrict(prefix, key []byte, flags base.SeekGEFlags) *base.InternalKV {
-	return i.update(i.iter.SeekPrefixGE(prefix, key, flags))
-}
-
-func (i *iter) SeekLT(key []byte, flags base.SeekLTFlags) *base.InternalKV {
+func (i *iter) SeekLT(key []byte, flags base.SeekLTFlags) (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.SeekLT(key, flags))
 }
 
-func (i *iter) First() *base.InternalKV {
+func (i *iter) First() (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.First())
 }
 
-func (i *iter) Last() *base.InternalKV {
+func (i *iter) Last() (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.Last())
 }
 
-func (i *iter) Next() *base.InternalKV {
+func (i *iter) Next() (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.Next())
 }
 
-func (i *iter) Prev() *base.InternalKV {
+func (i *iter) Prev() (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.Prev())
 }
 
-func (i *iter) NextPrefix(succKey []byte) *base.InternalKV {
+func (i *iter) NextPrefix(succKey []byte) (*base.InternalKey, base.LazyValue) {
 	return i.update(i.iter.NextPrefix(succKey))
 }
 
@@ -158,18 +155,6 @@ func (i *iter) Close() error {
 
 func (i *iter) SetBounds(lower, upper []byte) {
 	i.iter.SetBounds(lower, upper)
-}
-
-func (i *iter) SetContext(ctx context.Context) {
-	i.iter.SetContext(ctx)
-}
-
-// DebugTree is part of the InternalIterator interface.
-func (i *iter) DebugTree(tp treeprinter.Node) {
-	n := tp.Childf("%T(%p)", i, i)
-	if i.iter != nil {
-		i.iter.DebugTree(n)
-	}
 }
 
 func (i *iter) String() string {

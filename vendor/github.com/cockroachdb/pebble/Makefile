@@ -4,6 +4,7 @@ GOFLAGS :=
 STRESSFLAGS :=
 TAGS := invariants
 TESTS := .
+PREV_RELEASE := crl-release-23.1
 COVER_PROFILE := coverprofile.out
 
 .PHONY: all
@@ -17,7 +18,6 @@ all:
 	@echo "  make crossversion-meta"
 	@echo "  make testcoverage"
 	@echo "  make mod-update"
-	@echo "  make gen-bazel"
 	@echo "  make generate"
 	@echo "  make generate-test-data"
 	@echo "  make clean"
@@ -36,12 +36,10 @@ testrace: testflags += -race -timeout 20m
 testrace: test
 
 testasan: testflags += -asan -timeout 20m
-testasan: TAGS += slowbuild
 testasan: test
 
 testmsan: export CC=clang
 testmsan: testflags += -msan -timeout 20m
-testmsan: TAGS += slowbuild
 testmsan: test
 
 .PHONY: testobjiotracing
@@ -64,47 +62,16 @@ stressmeta: override TESTS = TestMeta$$
 stressmeta: stress
 
 .PHONY: crossversion-meta
-crossversion-meta: LATEST_RELEASE := crl-release-25.1
 crossversion-meta:
-	git checkout ${LATEST_RELEASE}; \
-		${GO} test -c ./internal/metamorphic -o './internal/metamorphic/crossversion/${LATEST_RELEASE}.test'; \
+	git checkout ${PREV_RELEASE}; \
+		${GO} test -c ./internal/metamorphic -o './internal/metamorphic/crossversion/${PREV_RELEASE}.test'; \
 		git checkout -; \
 		${GO} test -c ./internal/metamorphic -o './internal/metamorphic/crossversion/head.test'; \
-		${GO} test -tags '$(TAGS)' ${testflags} -v -timeout 20m -run 'TestMetaCrossVersion' ./internal/metamorphic/crossversion --version '${LATEST_RELEASE},${LATEST_RELEASE},${LATEST_RELEASE}.test' --version 'HEAD,HEAD,./head.test'
+		${GO} test -tags '$(TAGS)' ${testflags} -v -run 'TestMetaCrossVersion' ./internal/metamorphic/crossversion --version '${PREV_RELEASE},${PREV_RELEASE},${PREV_RELEASE}.test' --version 'HEAD,HEAD,./head.test'
 
 .PHONY: stress-crossversion
 stress-crossversion:
-	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-23.2 crl-release-24.1 crl-release-24.3 crl-release-25.1 master
-
-.PHONY: test-s390x-qemu
-test-s390x-qemu: TAGS += slowbuild
-test-s390x-qemu:
-	@echo "Running tests on s390x using QEMU"
-	@echo "Requires a recent linux with docker and qemu-user-static installed"
-	@echo "(sudo apt-get install -y qemu-user-static)"
-	@echo ""
-	@qemu-s390x-static --version
-	@echo ""
-	@docker run --rm -v "$(CURDIR):/pebble" --platform=linux/s390x golang:1.23 \
-		bash -c " \
-				uname -a && \
-				lscpu | grep Endian && \
-				cd /pebble && \
-				go version && \
-				go test -tags '$(TAGS)' -timeout 30m ./..."
-
-.PHONY: gen-bazel
-gen-bazel:
-	@echo "Generating WORKSPACE"
-	@echo 'workspace(name = "com_github_cockroachdb_pebble")' > WORKSPACE
-	@echo 'Running gazelle...'
-	${GO} run github.com/bazelbuild/bazel-gazelle/cmd/gazelle@v0.37.0 update --go_prefix=github.com/cockroachdb/pebble --repo_root=.
-	@echo 'You should now be able to build Cockroach using:'
-	@echo '  ./dev build short -- --override_repository=com_github_cockroachdb_pebble=${CURDIR}'
-
-.PHONY: clean-bazel
-clean-bazel:
-	git clean -dxf WORKSPACE BUILD.bazel '**/BUILD.bazel'
+	STRESS=1 ./scripts/run-crossversion-meta.sh crl-release-21.2 crl-release-22.1 crl-release-22.2 crl-release-23.1 master
 
 .PHONY: generate
 generate:
@@ -121,7 +88,6 @@ generate-test-data:
 	${GO} run -tags make_test_sstables ./tool/make_test_sstables.go
 	${GO} run -tags make_test_remotecat ./tool/make_test_remotecat.go
 
-.PHONY: mod-update
 mod-update:
 	${GO} get -u
 	${GO} mod tidy
@@ -149,9 +115,11 @@ endif
 	@${GO} mod tidy
 	$(MAKE) git-clean-check
 
+# TODO(radu): switch back to @latest once bogus doc changes are
+# addressed; see https://github.com/cockroachdb/crlfmt/pull/44
 .PHONY: format
 format:
-	go install -C internal/devtools github.com/cockroachdb/crlfmt && crlfmt -w -tab 2 .
+	go install github.com/cockroachdb/crlfmt@44a36ec7 && crlfmt -w -tab 2 .
 
 .PHONY: format-check
 format-check:

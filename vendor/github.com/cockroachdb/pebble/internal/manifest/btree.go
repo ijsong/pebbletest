@@ -6,45 +6,88 @@ package manifest
 
 import (
 	"bytes"
-	stdcmp "cmp"
 	"fmt"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
 )
 
-type btreeCmp func(*TableMetadata, *TableMetadata) int
+// The Annotator type defined below is used by other packages to lazily
+// compute a value over a B-Tree. Each node of the B-Tree stores one
+// `annotation` per annotator, containing the result of the computation over
+// the node's subtree.
+//
+// An annotation is marked as valid if it's current with the current subtree
+// state. Annotations are marked as invalid whenever a node will be mutated
+// (in mut).  Annotators may also return `false` from `Accumulate` to signal
+// that a computation for a file is not stable and may change in the future.
+// Annotations that include these unstable values are also marked as invalid
+// on the node, ensuring that future queries for the annotation will recompute
+// the value.
 
-func btreeCmpSeqNum(a, b *TableMetadata) int {
+// An Annotator defines a computation over a level's FileMetadata. If the
+// computation is stable and uses inputs that are fixed for the lifetime of
+// a FileMetadata, the LevelMetadata's internal data structures are annotated
+// with the intermediary computations. This allows the computation to be
+// computed incrementally as edits are applied to a level.
+type Annotator interface {
+	// Zero returns the zero value of an annotation. This value is returned
+	// when a LevelMetadata is empty. The dst argument, if non-nil, is an
+	// obsolete value previously returned by this Annotator and may be
+	// overwritten and reused to avoid a memory allocation.
+	Zero(dst interface{}) (v interface{})
+
+	// Accumulate computes the annotation for a single file in a level's
+	// metadata. It merges the file's value into dst and returns a bool flag
+	// indicating whether or not the value is stable and okay to cache as an
+	// annotation. If the file's value may change over the life of the file,
+	// the annotator must return false.
+	//
+	// Implementations may modify dst and return it to avoid an allocation.
+	Accumulate(m *FileMetadata, dst interface{}) (v interface{}, cacheOK bool)
+
+	// Merge combines two values src and dst, returning the result.
+	// Implementations may modify dst and return it to avoid an allocation.
+	Merge(src interface{}, dst interface{}) interface{}
+}
+
+type btreeCmp func(*FileMetadata, *FileMetadata) int
+
+func btreeCmpSeqNum(a, b *FileMetadata) int {
 	return a.cmpSeqNum(b)
 }
 
 func btreeCmpSmallestKey(cmp Compare) btreeCmp {
-	return func(a, b *TableMetadata) int {
+	return func(a, b *FileMetadata) int {
 		return a.cmpSmallestKey(b, cmp)
 	}
 }
 
-// btreeCmpSpecificOrder is used in tests to construct a B-Tree with a specific
-// ordering of TableMetadata within the tree. It's typically used to test
-// consistency checking code that needs to construct a malformed B-Tree.
-func btreeCmpSpecificOrder(files []*TableMetadata) btreeCmp {
-	m := map[*TableMetadata]int{}
+// btreeCmpSpecificOrder is used in tests to construct a B-Tree with a
+// specific ordering of FileMetadata within the tree. It's typically used to
+// test consistency checking code that needs to construct a malformed B-Tree.
+func btreeCmpSpecificOrder(files []*FileMetadata) btreeCmp {
+	m := map[*FileMetadata]int{}
 	for i, f := range files {
 		m[f] = i
 	}
-	return func(a, b *TableMetadata) int {
+	return func(a, b *FileMetadata) int {
 		ai, aok := m[a]
 		bi, bok := m[b]
 		if !aok || !bok {
 			panic("btreeCmpSliceOrder called with unknown files")
 		}
-		return stdcmp.Compare(ai, bi)
+		switch {
+		case ai < bi:
+			return -1
+		case ai > bi:
+			return +1
+		default:
+			return 0
+		}
 	}
 }
 
@@ -53,6 +96,16 @@ const (
 	maxItems = 2*degree - 1
 	minItems = degree - 1
 )
+
+type annotation struct {
+	annotator Annotator
+	// v is an annotation value, the output of either
+	// annotator.Value or annotator.Merge.
+	v interface{}
+	// valid indicates whether future reads of the annotation may use v as-is.
+	// If false, v will be zeroed and recalculated.
+	valid bool
+}
 
 type leafNode struct {
 	ref   atomic.Int32
@@ -67,12 +120,10 @@ type leafNode struct {
 	// count=subtreeCount, however the unsafe casting [leafToNode] performs make
 	// it risky and cumbersome.
 	subtreeCount int
-	items        [maxItems]*TableMetadata
+	items        [maxItems]*FileMetadata
 	// annot contains one annotation per annotator, merged over the entire
-	// node's files (and all descendants for non-leaf nodes). Protected by
-	// annotMu.
-	annotMu sync.RWMutex
-	annot   []annotation
+	// node's files (and all descendants for non-leaf nodes).
+	annot []annotation
 }
 
 type node struct {
@@ -109,16 +160,13 @@ func newNode() *node {
 // mutable node.
 func mut(n **node) *node {
 	if (*n).ref.Load() == 1 {
-		// Exclusive ownership. Can mutate in place. Still need to lock out
-		// any concurrent writes to annot.
-		(*n).annotMu.Lock()
-		defer (*n).annotMu.Unlock()
+		// Exclusive ownership. Can mutate in place.
 
 		// Whenever a node will be mutated, reset its annotations to be marked
 		// as uncached. This ensures any future calls to (*node).annotation
 		// will recompute annotations on the modified subtree.
 		for i := range (*n).annot {
-			(*n).annot[i].valid.Store(false)
+			(*n).annot[i].valid = false
 		}
 		return *n
 	}
@@ -129,72 +177,25 @@ func mut(n **node) *node {
 	// reference count to be greater than 1, we might be racing
 	// with another call to decRef on this node.
 	c := (*n).clone()
-	(*n).decRef(true /* contentsToo */, assertNoObsoleteFiles{})
+	(*n).decRef(true /* contentsToo */, nil)
 	*n = c
 	// NB: We don't need to clear annotations, because (*node).clone does not
 	// copy them.
 	return *n
 }
 
-// ObsoleteFilesSet accumulates files that now have zero references.
-type ObsoleteFilesSet interface {
-	// AddBacking appends the provided FileBacking to the list of obsolete
-	// files.
-	AddBacking(*FileBacking)
-	// AddBlob appends the provided BlobFileMetadata to the list of obsolete
-	// files.
-	AddBlob(*BlobFileMetadata)
-}
-
-// assertNoObsoleteFiles is an obsoleteFiles implementation that panics if its
-// methods are called.
-//
-// There are two sources of node dereferences: tree mutations and Version
-// dereferences. Files should only be made obsolete during Version dereferences,
-// during which this implementation will not be used (see Version.Unref).
-type assertNoObsoleteFiles struct{}
-
-// Assert that assertNoObsoleteFiles implements ObsoleteFilesSet.
-var _ ObsoleteFilesSet = assertNoObsoleteFiles{}
-
-// AddBacking appends the provided FileBacking to the list of obsolete files.
-func (assertNoObsoleteFiles) AddBacking(fb *FileBacking) {
-	panic(errors.AssertionFailedf("file backing %s dereferenced to zero during tree mutation", fb.DiskFileNum))
-}
-
-// AddBlob appends the provided BlobFileMetadata to the list of obsolete files.
-func (assertNoObsoleteFiles) AddBlob(bm *BlobFileMetadata) {
-	panic(errors.AssertionFailedf("blob file %s dereferenced to zero during tree mutation", bm.FileNum))
-}
-
-// ignoreObsoleteFiles is an ObsoleteFilesSet implementation that ignores
-// obsolete files. It's used in some contexts where we construct ephemeral
-// B-Trees which do not need to track obsolete files and in tests.
-type ignoreObsoleteFiles struct{}
-
-// Assert that ignoreObsoleteFiles implements ObsoleteFilesSet.
-var _ ObsoleteFilesSet = ignoreObsoleteFiles{}
-
-// AddBacking appends the provided FileBacking to the list of obsolete files.
-func (ignoreObsoleteFiles) AddBacking(fb *FileBacking) {}
-
-// AddBlob appends the provided BlobFileMetadata to the list of obsolete files.
-func (ignoreObsoleteFiles) AddBlob(bm *BlobFileMetadata) {}
-
 // incRef acquires a reference to the node.
 func (n *node) incRef() {
 	n.ref.Add(1)
 }
 
-// decRef releases a reference to the node. If requested, the method will call
-// the provided unref func on its items and recurse into child nodes and
-// decrease their refcounts as well.
-//
+// decRef releases a reference to the node. If requested, the method will unref
+// its items and recurse into child nodes and decrease their refcounts as well.
 // Some internal codepaths that manually copy the node's items or children to
 // new nodes pass contentsToo=false to preserve existing reference counts during
-// operations that should yield a net-zero change to descendant refcounts. When
-// a node is released, its contained files are dereferenced.
-func (n *node) decRef(contentsToo bool, obsolete ObsoleteFilesSet) {
+// operations that should yield a net-zero change to descendant refcounts.
+// When a node is released, its contained files are dereferenced.
+func (n *node) decRef(contentsToo bool, obsolete *[]*FileBacking) {
 	if n.ref.Add(-1) > 0 {
 		// Other references remain. Can't free.
 		return
@@ -202,11 +203,26 @@ func (n *node) decRef(contentsToo bool, obsolete ObsoleteFilesSet) {
 
 	// Dereference the node's metadata and release child references if
 	// requested. Some internal callers may not want to propagate the deref
-	// because they're manually copying the TableMetadata and children to other
+	// because they're manually copying the filemetadata and children to other
 	// nodes, and they want to preserve the existing reference count.
 	if contentsToo {
 		for _, f := range n.items[:n.count] {
-			f.Unref(obsolete)
+			if f.Unref() == 0 {
+				// There are two sources of node dereferences: tree mutations
+				// and Version dereferences. Files should only be made obsolete
+				// during Version dereferences, during which `obsolete` will be
+				// non-nil.
+				if obsolete == nil {
+					panic(fmt.Sprintf("file metadata %s dereferenced to zero during tree mutation", f.FileNum))
+				}
+				// Reference counting is performed on the FileBacking. In the case
+				// of a virtual sstable, this reference counting is performed on
+				// a FileBacking which is shared by every single virtual sstable
+				// with the same backing sstable. If the reference count hits 0,
+				// then we know that the FileBacking won't be required by any
+				// sstable in Pebble, and that the backing sstable can be deleted.
+				*obsolete = append(*obsolete, f.FileBacking)
+			}
 		}
 		if !n.leaf {
 			for i := int16(0); i <= n.count; i++ {
@@ -246,7 +262,7 @@ func (n *node) clone() *node {
 // insertAt inserts the provided file and node at the provided index. This
 // function is for use only as a helper function for internal B-Tree code.
 // Clients should not invoke it directly.
-func (n *node) insertAt(index int, item *TableMetadata, nd *node) {
+func (n *node) insertAt(index int, item *FileMetadata, nd *node) {
 	if index < int(n.count) {
 		copy(n.items[index+1:n.count+1], n.items[index:n.count])
 		if !n.leaf {
@@ -263,7 +279,7 @@ func (n *node) insertAt(index int, item *TableMetadata, nd *node) {
 // pushBack inserts the provided file and node at the tail of the node's items.
 // This function is for use only as a helper function for internal B-Tree code.
 // Clients should not invoke it directly.
-func (n *node) pushBack(item *TableMetadata, nd *node) {
+func (n *node) pushBack(item *FileMetadata, nd *node) {
 	n.items[n.count] = item
 	if !n.leaf {
 		n.children[n.count+1] = nd
@@ -274,7 +290,7 @@ func (n *node) pushBack(item *TableMetadata, nd *node) {
 // pushFront inserts the provided file and node at the head of the
 // node's items. This function is for use only as a helper function for internal B-Tree
 // code. Clients should not invoke it directly.
-func (n *node) pushFront(item *TableMetadata, nd *node) {
+func (n *node) pushFront(item *FileMetadata, nd *node) {
 	if !n.leaf {
 		copy(n.children[1:n.count+2], n.children[:n.count+1])
 		n.children[0] = nd
@@ -287,7 +303,7 @@ func (n *node) pushFront(item *TableMetadata, nd *node) {
 // removeAt removes a value at a given index, pulling all subsequent values
 // back. This function is for use only as a helper function for internal B-Tree
 // code. Clients should not invoke it directly.
-func (n *node) removeAt(index int) (*TableMetadata, *node) {
+func (n *node) removeAt(index int) (*FileMetadata, *node) {
 	var child *node
 	if !n.leaf {
 		child = n.children[index+1]
@@ -304,7 +320,7 @@ func (n *node) removeAt(index int) (*TableMetadata, *node) {
 // popBack removes and returns the last element in the list. This function is
 // for use only as a helper function for internal B-Tree code. Clients should
 // not invoke it directly.
-func (n *node) popBack() (*TableMetadata, *node) {
+func (n *node) popBack() (*FileMetadata, *node) {
 	n.count--
 	out := n.items[n.count]
 	n.items[n.count] = nil
@@ -319,7 +335,7 @@ func (n *node) popBack() (*TableMetadata, *node) {
 // popFront removes and returns the first element in the list. This function is
 // for use only as a helper function for internal B-Tree code. Clients should
 // not invoke it directly.
-func (n *node) popFront() (*TableMetadata, *node) {
+func (n *node) popFront() (*FileMetadata, *node) {
 	n.count--
 	var child *node
 	if !n.leaf {
@@ -339,14 +355,14 @@ func (n *node) popFront() (*TableMetadata, *node) {
 //
 // This function is for use only as a helper function for internal B-Tree code.
 // Clients should not invoke it directly.
-func (n *node) find(bcmp btreeCmp, item *TableMetadata) (index int, found bool) {
+func (n *node) find(cmp btreeCmp, item *FileMetadata) (index int, found bool) {
 	// Logic copied from sort.Search. Inlining this gave
 	// an 11% speedup on BenchmarkBTreeDeleteInsert.
 	i, j := 0, int(n.count)
 	for i < j {
 		h := int(uint(i+j) >> 1) // avoid overflow when computing h
 		// i ≤ h < j
-		v := bcmp(item, n.items[h])
+		v := cmp(item, n.items[h])
 		if v == 0 {
 			return h, true
 		} else if v > 0 {
@@ -390,7 +406,7 @@ func (n *node) find(bcmp btreeCmp, item *TableMetadata) (index int, found bool) 
 //
 // This function is for use only as a helper function for internal B-Tree code.
 // Clients should not invoke it directly.
-func (n *node) split(i int) (*TableMetadata, *node) {
+func (n *node) split(i int) (*FileMetadata, *node) {
 	out := n.items[i]
 	var next *node
 	if n.leaf {
@@ -425,8 +441,8 @@ func (n *node) split(i int) (*TableMetadata, *node) {
 
 // Insert inserts a item into the subtree rooted at this node, making sure no
 // nodes in the subtree exceed maxItems items.
-func (n *node) Insert(bcmp btreeCmp, item *TableMetadata) error {
-	i, found := n.find(bcmp, item)
+func (n *node) Insert(cmp btreeCmp, item *FileMetadata) error {
+	i, found := n.find(cmp, item)
 	if found {
 		// cmp provides a total ordering of the files within a level.
 		// If we're inserting a metadata that's equal to an existing item
@@ -443,7 +459,7 @@ func (n *node) Insert(bcmp btreeCmp, item *TableMetadata) error {
 		splitLa, splitNode := mut(&n.children[i]).split(maxItems / 2)
 		n.insertAt(i, splitLa, splitNode)
 
-		switch cmp := bcmp(item, n.items[i]); {
+		switch cmp := cmp(item, n.items[i]); {
 		case cmp < 0:
 			// no change, we want first split node
 		case cmp > 0:
@@ -457,7 +473,7 @@ func (n *node) Insert(bcmp btreeCmp, item *TableMetadata) error {
 		}
 	}
 
-	err := mut(&n.children[i]).Insert(bcmp, item)
+	err := mut(&n.children[i]).Insert(cmp, item)
 	if err == nil {
 		n.subtreeCount++
 	}
@@ -467,7 +483,7 @@ func (n *node) Insert(bcmp btreeCmp, item *TableMetadata) error {
 // removeMax removes and returns the maximum item from the subtree rooted at
 // this node. This function is for use only as a helper function for internal
 // B-Tree code. Clients should not invoke it directly.
-func (n *node) removeMax() *TableMetadata {
+func (n *node) removeMax() *FileMetadata {
 	if n.leaf {
 		n.count--
 		n.subtreeCount--
@@ -486,8 +502,8 @@ func (n *node) removeMax() *TableMetadata {
 
 // Remove removes a item from the subtree rooted at this node. Returns
 // the item that was removed or nil if no matching item was found.
-func (n *node) Remove(bcmp btreeCmp, item *TableMetadata) (out *TableMetadata) {
-	i, found := n.find(bcmp, item)
+func (n *node) Remove(cmp btreeCmp, item *FileMetadata) (out *FileMetadata) {
+	i, found := n.find(cmp, item)
 	if n.leaf {
 		if found {
 			out, _ = n.removeAt(i)
@@ -499,7 +515,7 @@ func (n *node) Remove(bcmp btreeCmp, item *TableMetadata) (out *TableMetadata) {
 	if n.children[i].count <= minItems {
 		// Child not large enough to remove from.
 		n.rebalanceOrMerge(i)
-		return n.Remove(bcmp, item)
+		return n.Remove(cmp, item)
 	}
 	child := mut(&n.children[i])
 	if found {
@@ -510,7 +526,7 @@ func (n *node) Remove(bcmp btreeCmp, item *TableMetadata) (out *TableMetadata) {
 		return out
 	}
 	// File is not in this node and child is large enough to remove from.
-	out = child.Remove(bcmp, item)
+	out = child.Remove(cmp, item)
 	if out != nil {
 		n.subtreeCount--
 	}
@@ -645,8 +661,80 @@ func (n *node) rebalanceOrMerge(i int) {
 		child.count += mergeChild.count + 1
 		child.subtreeCount += mergeChild.subtreeCount + 1
 
-		mergeChild.decRef(false /* contentsToo */, assertNoObsoleteFiles{})
+		mergeChild.decRef(false /* contentsToo */, nil)
 	}
+}
+
+// InvalidateAnnotation removes any existing cached annotations for the provided
+// annotator from this node's subtree.
+func (n *node) InvalidateAnnotation(a Annotator) {
+	// Find this annotator's annotation on this node.
+	var annot *annotation
+	for i := range n.annot {
+		if n.annot[i].annotator == a {
+			annot = &n.annot[i]
+		}
+	}
+
+	if annot != nil && annot.valid {
+		annot.valid = false
+		annot.v = a.Zero(annot.v)
+	}
+	if !n.leaf {
+		for i := int16(0); i <= n.count; i++ {
+			n.children[i].InvalidateAnnotation(a)
+		}
+	}
+}
+
+// Annotation retrieves, computing if not already computed, the provided
+// annotator's annotation of this node. The second return value indicates
+// whether the future reads of this annotation may use the first return value
+// as-is. If false, the annotation is not stable and may change on a subsequent
+// computation.
+func (n *node) Annotation(a Annotator) (interface{}, bool) {
+	// Find this annotator's annotation on this node.
+	var annot *annotation
+	for i := range n.annot {
+		if n.annot[i].annotator == a {
+			annot = &n.annot[i]
+		}
+	}
+
+	// If it exists and is marked as valid, we can return it without
+	// recomputing anything.
+	if annot != nil && annot.valid {
+		return annot.v, true
+	}
+
+	if annot == nil {
+		// This is n's first time being annotated by a.
+		// Create a new zeroed annotation.
+		n.annot = append(n.annot, annotation{
+			annotator: a,
+			v:         a.Zero(nil),
+		})
+		annot = &n.annot[len(n.annot)-1]
+	} else {
+		// There's an existing annotation that must be recomputed.
+		// Zero its value.
+		annot.v = a.Zero(annot.v)
+	}
+
+	annot.valid = true
+	for i := int16(0); i <= n.count; i++ {
+		if !n.leaf {
+			v, ok := n.children[i].Annotation(a)
+			annot.v = a.Merge(v, annot.v)
+			annot.valid = annot.valid && ok
+		}
+		if i < n.count {
+			v, ok := a.Accumulate(n.items[i], annot.v)
+			annot.v = v
+			annot.valid = annot.valid && ok
+		}
+	}
+	return annot.v, annot.valid
 }
 
 func (n *node) verifyInvariants() {
@@ -665,28 +753,27 @@ func (n *node) verifyInvariants() {
 
 // btree is an implementation of a B-Tree.
 //
-// btree stores TableMetadata in an ordered structure, allowing easy insertion,
+// btree stores FileMetadata in an ordered structure, allowing easy insertion,
 // removal, and iteration. The B-Tree stores items in order based on cmp. The
 // first level of the LSM uses a cmp function that compares sequence numbers.
-// All other levels compare using the TableMetadata.Smallest.
+// All other levels compare using the FileMetadata.Smallest.
 //
 // Write operations are not safe for concurrent mutation by multiple
 // goroutines, but Read operations are.
 type btree struct {
 	root *node
-	cmp  base.Compare
-	bcmp btreeCmp
+	cmp  btreeCmp
 }
 
 // Release dereferences and clears the root node of the btree, removing all
-// items from the btree. In doing so, it unrefs files associated with the
-// tables. Any files that no longer have outstanding references are added to the
-// provided obsoleteFiles.
-func (t *btree) Release(of ObsoleteFilesSet) {
+// items from the btree. In doing so, it decrements contained file counts.
+// It returns a slice of newly obsolete backing files, if any.
+func (t *btree) Release() (obsolete []*FileBacking) {
 	if t.root != nil {
-		t.root.decRef(true /* contentsToo */, of)
+		t.root.decRef(true /* contentsToo */, &obsolete)
 		t.root = nil
 	}
+	return obsolete
 }
 
 // Clone clones the btree, lazily. It does so in constant time.
@@ -712,15 +799,14 @@ func (t *btree) Clone() btree {
 	return c
 }
 
-// Delete removes the provided table from the tree, unrefing the table's files
-// if it's found. If any files are unreferenced to zero, they're added to the
-// provided obsoleteFiles.
-func (t *btree) Delete(item *TableMetadata, of ObsoleteFilesSet) {
+// Delete removes the provided file from the tree.
+// It returns true if the file now has a zero reference count.
+func (t *btree) Delete(item *FileMetadata) (obsolete bool) {
 	if t.root == nil || t.root.count == 0 {
-		return
+		return false
 	}
-	if out := mut(&t.root).Remove(t.bcmp, item); out != nil {
-		out.Unref(of)
+	if out := mut(&t.root).Remove(t.cmp, item); out != nil {
+		obsolete = out.Unref() == 0
 	}
 	if invariants.Enabled {
 		t.root.verifyInvariants()
@@ -732,13 +818,14 @@ func (t *btree) Delete(item *TableMetadata, of ObsoleteFilesSet) {
 		} else {
 			t.root = t.root.children[0]
 		}
-		old.decRef(false /* contentsToo */, assertNoObsoleteFiles{})
+		old.decRef(false /* contentsToo */, nil)
 	}
+	return obsolete
 }
 
 // Insert adds the given item to the tree. If a item in the tree already
 // equals the given one, Insert panics.
-func (t *btree) Insert(item *TableMetadata) error {
+func (t *btree) Insert(item *FileMetadata) error {
 	if t.root == nil {
 		t.root = newLeafNode()
 	} else if t.root.count >= maxItems {
@@ -752,7 +839,7 @@ func (t *btree) Insert(item *TableMetadata) error {
 		t.root = newRoot
 	}
 	item.Ref()
-	err := mut(&t.root).Insert(t.bcmp, item)
+	err := mut(&t.root).Insert(t.cmp, item)
 	if invariants.Enabled {
 		t.root.verifyInvariants()
 	}
@@ -763,7 +850,7 @@ func (t *btree) Insert(item *TableMetadata) error {
 // iterator after modifications are made to the tree. If modifications are made,
 // create a new iterator.
 func (t *btree) Iter() iterator {
-	return iterator{r: t.root, pos: -1, cmp: t.bcmp}
+	return iterator{r: t.root, pos: -1, cmp: t.cmp}
 }
 
 // Count returns the number of files contained within the B-Tree.
@@ -898,8 +985,8 @@ type iterator struct {
 	// n may be nil iff i.r is nil.
 	n   *node
 	pos int16
-	// cmp dictates the ordering of the TableMetadata.
-	cmp func(*TableMetadata, *TableMetadata) int
+	// cmp dictates the ordering of the FileMetadata.
+	cmp func(*FileMetadata, *FileMetadata) int
 	// a stack of n's ancestors within the B-Tree, alongside the position
 	// taken to arrive at n. If non-empty, the bottommost frame of the stack
 	// will always contain the B-Tree root.
@@ -1051,11 +1138,15 @@ func cmpIter(a, b iterator) int {
 		if af.n != bf.n {
 			panic("nonmatching nodes during btree iterator comparison")
 		}
-		if v := stdcmp.Compare(af.pos, bf.pos); v != 0 {
-			return v
+		switch {
+		case af.pos < bf.pos:
+			return -1
+		case af.pos > bf.pos:
+			return +1
+		default:
+			// Continue up both iterators' stacks (equivalently, down the
+			// B-Tree away from the root).
 		}
-		// Otherwise continue up both iterators' stacks (equivalently, down the
-		// B-Tree away from the root).
 	}
 
 	if aok && bok {
@@ -1064,20 +1155,24 @@ func cmpIter(a, b iterator) int {
 	if an != bn {
 		panic("nonmatching nodes during btree iterator comparison")
 	}
-	if v := stdcmp.Compare(apos, bpos); v != 0 {
-		return v
-	}
 	switch {
-	case aok:
-		// a is positioned at a leaf child at this position and b is at an
-		// end sentinel state.
+	case apos < bpos:
 		return -1
-	case bok:
-		// b is positioned at a leaf child at this position and a is at an
-		// end sentinel state.
+	case apos > bpos:
 		return +1
 	default:
-		return 0
+		switch {
+		case aok:
+			// a is positioned at a leaf child at this position and b is at an
+			// end sentinel state.
+			return -1
+		case bok:
+			// b is positioned at a leaf child at this position and a is at an
+			// end sentinel state.
+			return +1
+		default:
+			return 0
+		}
 	}
 }
 
@@ -1100,7 +1195,7 @@ func (i *iterator) ascend() {
 // function.  Like sort.Search, seek requires the iterator's B-Tree to be
 // ordered such that fn returns false for some (possibly empty) prefix of the
 // tree's files, and then true for the (possibly empty) remainder.
-func (i *iterator) seek(fn func(*TableMetadata) bool) {
+func (i *iterator) seek(fn func(*FileMetadata) bool) {
 	i.reset()
 	if i.r == nil {
 		return
@@ -1215,7 +1310,7 @@ func (i *iterator) valid() bool {
 
 // cur returns the item at the iterator's current position. It is illegal
 // to call cur if the iterator is not valid.
-func (i *iterator) cur() *TableMetadata {
+func (i *iterator) cur() *FileMetadata {
 	if invariants.Enabled && !i.valid() {
 		panic("btree iterator.cur invoked on invalid iterator")
 	}

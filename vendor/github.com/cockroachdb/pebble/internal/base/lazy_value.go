@@ -4,11 +4,7 @@
 
 package base
 
-import (
-	"context"
-
-	"github.com/cockroachdb/errors"
-)
+import "github.com/cockroachdb/pebble/internal/invariants"
 
 // A value can have user-defined attributes that are a function of the value
 // byte slice. For now, we only support "short attributes", which can be
@@ -44,7 +40,7 @@ type ShortAttributeExtractor func(
 // AttributeAndLen represents the pair of value length and the short
 // attribute.
 type AttributeAndLen struct {
-	ValueLen       uint32
+	ValueLen       int32
 	ShortAttribute ShortAttribute
 }
 
@@ -169,10 +165,7 @@ type LazyFetcher struct {
 	err     error
 	value   []byte
 	// Attribute includes the short attribute and value length.
-	Attribute AttributeAndLen
-	// BlobFileNum identifies the blob file containing the value. It is only
-	// populated if the value is stored in a blob file.
-	BlobFileNum DiskFileNum
+	Attribute   AttributeAndLen
 	fetched     bool
 	callerOwned bool
 }
@@ -191,8 +184,7 @@ type ValueFetcher interface {
 	// will allocate a new slice for the value. In either case it will set
 	// callerOwned to true.
 	Fetch(
-		ctx context.Context, handle []byte, blobFileNum DiskFileNum, valLen uint32, buf []byte,
-	) (val []byte, callerOwned bool, err error)
+		handle []byte, valLen int32, buf []byte) (val []byte, callerOwned bool, err error)
 }
 
 // Value returns the underlying value.
@@ -209,20 +201,27 @@ func (lv *LazyValue) Value(buf []byte) (val []byte, callerOwned bool, err error)
 	// more performance. I suspect that inlining this only matters in
 	// micro-benchmarks, and in actual use cases in CockroachDB it will not
 	// matter because there is substantial work done with a fetched value.
-	return lv.fetchValue(context.TODO(), buf)
+	return lv.fetchValue(buf)
 }
 
 // INVARIANT: lv.Fetcher != nil
-func (lv *LazyValue) fetchValue(
-	ctx context.Context, buf []byte,
-) (val []byte, callerOwned bool, err error) {
+func (lv *LazyValue) fetchValue(buf []byte) (val []byte, callerOwned bool, err error) {
 	f := lv.Fetcher
 	if !f.fetched {
 		f.fetched = true
-		f.value, f.callerOwned, f.err = f.Fetcher.Fetch(ctx,
-			lv.ValueOrHandle, f.BlobFileNum, f.Attribute.ValueLen, buf)
+		f.value, f.callerOwned, f.err = f.Fetcher.Fetch(
+			lv.ValueOrHandle, lv.Fetcher.Attribute.ValueLen, buf)
 	}
 	return f.value, f.callerOwned, f.err
+}
+
+// InPlaceValue returns the value under the assumption that it is in-place.
+// This is for Pebble-internal code.
+func (lv *LazyValue) InPlaceValue() []byte {
+	if invariants.Enabled && lv.Fetcher != nil {
+		panic("value must be in-place")
+	}
+	return lv.ValueOrHandle
 }
 
 // Len returns the length of the value.
@@ -266,9 +265,8 @@ func (lv *LazyValue) Clone(buf []byte, fetcher *LazyFetcher) (LazyValue, []byte)
 	var lvCopy LazyValue
 	if lv.Fetcher != nil {
 		*fetcher = LazyFetcher{
-			Fetcher:     lv.Fetcher.Fetcher,
-			Attribute:   lv.Fetcher.Attribute,
-			BlobFileNum: lv.Fetcher.BlobFileNum,
+			Fetcher:   lv.Fetcher.Fetcher,
+			Attribute: lv.Fetcher.Attribute,
 			// Not copying anything that has been extracted.
 		}
 		lvCopy.Fetcher = fetcher
@@ -283,25 +281,7 @@ func (lv *LazyValue) Clone(buf []byte, fetcher *LazyFetcher) (LazyValue, []byte)
 	return lvCopy, buf
 }
 
-// NoBlobFetches is a ValueFetcher that returns an error. It's intended to be
-// used in situations where sstables should not encode a blob value, or the
-// caller should not fetch the handle's value.
-var NoBlobFetches = &errValueFetcher{
-	Err: errors.AssertionFailedf("unexpected blob value"),
-}
-
-// errValueFetcher is a ValueFetcher that returns an error.
-type errValueFetcher struct {
-	Err error
-}
-
-// Assert that *errValueFetcher implements base.ValueFetcher.
-var _ ValueFetcher = (*errValueFetcher)(nil)
-
-// Fetch implements base.ValueFetcher.
-func (e *errValueFetcher) Fetch(
-	_ context.Context, _ []byte, blobFileNum DiskFileNum, valLen uint32, _ []byte,
-) (val []byte, callerOwned bool, err error) {
-	err = errors.Wrapf(e.Err, "fetching %d-byte value from %s", valLen, blobFileNum)
-	return nil, false, err
+// MakeInPlaceValue constructs an in-place value.
+func MakeInPlaceValue(val []byte) LazyValue {
+	return LazyValue{ValueOrHandle: val}
 }

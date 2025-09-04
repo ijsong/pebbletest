@@ -26,23 +26,23 @@ func (p *provider) vfsOpenForReading(
 	filename := p.vfsPath(fileType, fileNum)
 	file, err := p.st.FS.Open(filename, vfs.RandomReadsOption)
 	if err != nil {
-		if opts.MustExist && p.IsNotExistError(err) {
-			err = base.AddDetailsToNotExistError(p.st.FS, filename, err)
-			err = base.MarkCorruptionError(err)
+		if opts.MustExist {
+			base.MustExist(p.st.FS, filename, p.st.Logger, err)
 		}
 		return nil, err
 	}
-	return newFileReadable(file, p.st.FS, p.st.Local.ReadaheadConfig, filename)
+	readaheadConfig := DefaultReadaheadConfig
+	if f := p.st.Local.ReadaheadConfigFn; f != nil {
+		readaheadConfig = f()
+	}
+	return newFileReadable(file, p.st.FS, readaheadConfig, filename)
 }
 
 func (p *provider) vfsCreate(
-	_ context.Context,
-	fileType base.FileType,
-	fileNum base.DiskFileNum,
-	category vfs.DiskWriteCategory,
+	_ context.Context, fileType base.FileType, fileNum base.DiskFileNum,
 ) (objstorage.Writable, objstorage.ObjectMetadata, error) {
 	filename := p.vfsPath(fileType, fileNum)
-	file, err := p.st.FS.Create(filename, category)
+	file, err := p.st.FS.Create(filename)
 	if err != nil {
 		return nil, objstorage.ObjectMetadata{}, err
 	}
@@ -74,15 +74,12 @@ func (p *provider) vfsInit() error {
 
 	for _, filename := range listing {
 		fileType, fileNum, ok := base.ParseFilename(p.st.FS, filename)
-		if ok {
-			switch fileType {
-			case base.FileTypeTable, base.FileTypeBlob:
-				o := objstorage.ObjectMetadata{
-					FileType:    fileType,
-					DiskFileNum: fileNum,
-				}
-				p.mu.knownObjects[o.DiskFileNum] = o
+		if ok && fileType == base.FileTypeTable {
+			o := objstorage.ObjectMetadata{
+				FileType:    fileType,
+				DiskFileNum: fileNum,
 			}
+			p.mu.knownObjects[o.DiskFileNum] = o
 		}
 	}
 	return nil
@@ -90,23 +87,19 @@ func (p *provider) vfsInit() error {
 
 func (p *provider) vfsSync() error {
 	p.mu.Lock()
-	counterVal := p.mu.localObjectsChangeCounter
-	lastSynced := p.mu.localObjectsChangeCounterSynced
+	shouldSync := p.mu.localObjectsChanged
+	p.mu.localObjectsChanged = false
 	p.mu.Unlock()
 
-	if lastSynced >= counterVal {
+	if !shouldSync {
 		return nil
 	}
 	if err := p.fsDir.Sync(); err != nil {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.mu.localObjectsChanged = true
 		return err
 	}
-
-	p.mu.Lock()
-	if p.mu.localObjectsChangeCounterSynced < counterVal {
-		p.mu.localObjectsChangeCounterSynced = counterVal
-	}
-	p.mu.Unlock()
-
 	return nil
 }
 

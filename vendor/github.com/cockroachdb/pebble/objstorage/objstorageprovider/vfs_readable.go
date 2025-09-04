@@ -25,18 +25,17 @@ type fileReadable struct {
 	file vfs.File
 	size int64
 
-	readaheadConfig *ReadaheadConfig
-
 	// The following fields are used to possibly open the file again using the
 	// sequential reads option (see vfsReadHandle).
-	filename string
-	fs       vfs.FS
+	filename        string
+	fs              vfs.FS
+	readaheadConfig ReadaheadConfig
 }
 
 var _ objstorage.Readable = (*fileReadable)(nil)
 
 func newFileReadable(
-	file vfs.File, fs vfs.FS, readaheadConfig *ReadaheadConfig, filename string,
+	file vfs.File, fs vfs.FS, readaheadConfig ReadaheadConfig, filename string,
 ) (*fileReadable, error) {
 	info, err := file.Stat()
 	if err != nil {
@@ -49,14 +48,12 @@ func newFileReadable(
 		fs:              fs,
 		readaheadConfig: readaheadConfig,
 	}
-	if invariants.UseFinalizers {
-		invariants.SetFinalizer(r, func(obj interface{}) {
-			if obj.(*fileReadable).file != nil {
-				fmt.Fprintf(os.Stderr, "Readable was not closed")
-				os.Exit(1)
-			}
-		})
-	}
+	invariants.SetFinalizer(r, func(obj interface{}) {
+		if obj.(*fileReadable).file != nil {
+			fmt.Fprintf(os.Stderr, "Readable was not closed")
+			os.Exit(1)
+		}
+	})
 	return r, nil
 }
 
@@ -81,9 +78,7 @@ func (r *fileReadable) Size() int64 {
 }
 
 // NewReadHandle is part of the objstorage.Readable interface.
-func (r *fileReadable) NewReadHandle(
-	readBeforeSize objstorage.ReadBeforeSize,
-) objstorage.ReadHandle {
+func (r *fileReadable) NewReadHandle(_ context.Context) objstorage.ReadHandle {
 	rh := readHandlePool.Get().(*vfsReadHandle)
 	rh.init(r)
 	return rh
@@ -106,14 +101,13 @@ var _ objstorage.ReadHandle = (*vfsReadHandle)(nil)
 var readHandlePool = sync.Pool{
 	New: func() interface{} {
 		i := &vfsReadHandle{}
-		if invariants.UseFinalizers {
-			invariants.SetFinalizer(i, func(obj interface{}) {
-				if obj.(*vfsReadHandle).r != nil {
-					fmt.Fprintf(os.Stderr, "ReadHandle was not closed")
-					os.Exit(1)
-				}
-			})
-		}
+		// Note: this is a no-op if invariants are disabled or race is enabled.
+		invariants.SetFinalizer(i, func(obj interface{}) {
+			if obj.(*vfsReadHandle).r != nil {
+				fmt.Fprintf(os.Stderr, "ReadHandle was not closed")
+				os.Exit(1)
+			}
+		})
 		return i
 	},
 }
@@ -122,7 +116,7 @@ func (rh *vfsReadHandle) init(r *fileReadable) {
 	*rh = vfsReadHandle{
 		r:             r,
 		rs:            makeReadaheadState(fileMaxReadaheadSize),
-		readaheadMode: r.readaheadConfig.Speculative(),
+		readaheadMode: r.readaheadConfig.Speculative,
 	}
 }
 
@@ -167,7 +161,7 @@ func (rh *vfsReadHandle) ReadAt(_ context.Context, p []byte, offset int64) error
 
 // SetupForCompaction is part of the objstorage.ReadHandle interface.
 func (rh *vfsReadHandle) SetupForCompaction() {
-	rh.readaheadMode = rh.r.readaheadConfig.Informed()
+	rh.readaheadMode = rh.r.readaheadConfig.Informed
 	if rh.readaheadMode == FadviseSequential {
 		rh.switchToOSReadahead()
 	}
@@ -232,13 +226,11 @@ func (rh *PreallocatedReadHandle) Close() error {
 // (currently this happens if we are reading from a local file).
 // The returned handle still needs to be closed.
 func UsePreallocatedReadHandle(
-	readable objstorage.Readable,
-	readBeforeSize objstorage.ReadBeforeSize,
-	rh *PreallocatedReadHandle,
+	ctx context.Context, readable objstorage.Readable, rh *PreallocatedReadHandle,
 ) objstorage.ReadHandle {
 	if r, ok := readable.(*fileReadable); ok {
 		rh.init(r)
 		return rh
 	}
-	return readable.NewReadHandle(readBeforeSize)
+	return readable.NewReadHandle(ctx)
 }

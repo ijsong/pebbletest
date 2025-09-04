@@ -58,12 +58,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"math/rand/v2"
+	"time"
 	"unsafe"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/constants"
+	"golang.org/x/exp/rand"
 )
 
 const (
@@ -124,7 +125,7 @@ type Skiplist struct {
 	head           uint32
 	tail           uint32
 	height         uint32 // Current height: 1 <= height <= maxHeight
-	rand           rand.PCG
+	rand           rand.PCGSource
 }
 
 var (
@@ -172,7 +173,7 @@ func (s *Skiplist) Init(storage *[]byte, cmp base.Compare, abbreviatedKey base.A
 		nodes:          s.nodes[:0],
 		height:         1,
 	}
-	s.rand.Seed(0, rand.Uint64())
+	s.rand.Seed(uint64(time.Now().UnixNano()))
 
 	const initBufSize = 256
 	if cap(s.nodes) < initBufSize {
@@ -414,7 +415,7 @@ func (s *Skiplist) getKey(nd uint32) base.InternalKey {
 	n := s.node(nd)
 	kind := base.InternalKeyKind((*s.storage)[n.offset])
 	key := (*s.storage)[n.keyStart:n.keyEnd]
-	return base.MakeInternalKey(key, base.SeqNum(n.offset)|base.SeqNumBatchBit, kind)
+	return base.MakeInternalKey(key, uint64(n.offset)|base.InternalKeySeqNumBatch, kind)
 }
 
 func (s *Skiplist) getNext(nd, h uint32) uint32 {

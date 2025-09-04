@@ -7,8 +7,6 @@ package remote
 import (
 	"context"
 	"io"
-
-	"github.com/cockroachdb/redact"
 )
 
 // Locator is an opaque string identifying a remote.Storage implementation.
@@ -17,11 +15,6 @@ import (
 // stored on disk in the shared object catalog and are passed around as part of
 // RemoteObjectBacking; they can also appear in error messages.
 type Locator string
-
-// SafeFormat implements redact.SafeFormatter.
-func (l Locator) SafeFormat(w redact.SafePrinter, _ rune) {
-	w.Printf("%s", redact.SafeString(l))
-}
 
 // StorageFactory is used to return Storage implementations based on locators. A
 // Pebble store that uses shared storage is configured with a StorageFactory.
@@ -130,19 +123,4 @@ type ObjectReader interface {
 	ReadAt(ctx context.Context, p []byte, offset int64) error
 
 	Close() error
-}
-
-// ObjectKey is a (locator, object name) pair which uniquely identifies a remote
-// object and can be used as a map key.
-type ObjectKey struct {
-	Locator    Locator
-	ObjectName string
-}
-
-// MakeObjectKey is a convenience constructor for ObjectKey.
-func MakeObjectKey(locator Locator, objectName string) ObjectKey {
-	return ObjectKey{
-		Locator:    locator,
-		ObjectName: objectName,
-	}
 }

@@ -3,11 +3,11 @@
 // the LICENSE file.
 
 //go:build windows
+// +build windows
 
 package vfs
 
 import (
-	"io/fs"
 	"os"
 	"syscall"
 
@@ -36,7 +36,6 @@ type windowsDir struct {
 	*os.File
 }
 
-func (d *windowsDir) Stat() (FileInfo, error)                 { return maybeWrapFileInfo(d.File.Stat()) }
 func (*windowsDir) Prefetch(offset int64, length int64) error { return nil }
 func (*windowsDir) Preallocate(off, length int64) error       { return nil }
 
@@ -53,16 +52,10 @@ type windowsFile struct {
 func (*windowsFile) Prefetch(offset int64, length int64) error { return nil }
 func (*windowsFile) Preallocate(offset, length int64) error    { return nil }
 
-func (f *windowsFile) Stat() (FileInfo, error) { return maybeWrapFileInfo(f.File.Stat()) }
-func (f *windowsFile) SyncData() error         { return f.Sync() }
+func (f *windowsFile) SyncData() error { return f.Sync() }
 func (f *windowsFile) SyncTo(length int64) (fullSync bool, err error) {
 	if err = f.Sync(); err != nil {
 		return false, err
 	}
 	return true, nil
-}
-
-func deviceIDFromFileInfo(finfo fs.FileInfo) DeviceID {
-	// Unsupported.
-	return DeviceID{}
 }

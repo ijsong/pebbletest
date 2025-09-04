@@ -12,18 +12,14 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
-	"github.com/cockroachdb/pebble/internal/manifest"
-	"github.com/cockroachdb/pebble/internal/manual"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider/sharedcache"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
-	"github.com/cockroachdb/pebble/sstable/block"
-	"github.com/cockroachdb/pebble/wal"
 	"github.com/cockroachdb/redact"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// CacheMetrics holds metrics for the block and file cache.
+// CacheMetrics holds metrics for the block and table cache.
 type CacheMetrics = cache.Metrics
 
 // FilterMetrics holds metrics for the filter policy
@@ -54,17 +50,9 @@ type LevelMetrics struct {
 	Size int64
 	// The total size of the virtual sstables in the level.
 	VirtualSize uint64
-	// The level's compaction score, used to rank levels (0 if the level doesn't
-	// need compaction). This is equal to the uncompensatedScoreRatio in the
-	// candidateLevel or 0 depending on when candidateLevel.shouldCompact().
+	// The level's compaction score. This is the compensatedScoreRatio in the
+	// candidateLevelInfo.
 	Score float64
-	// The level's compaction score. This is the uncompensatedStore in the
-	// candidateLevelInfo.
-	UncompensatedScore float64
-	// The level's compaction score, compensated with an estimate of the disk
-	// space that can be reclaimed. This is the compensatedScore in the
-	// candidateLevelInfo.
-	CompensatedScore float64
 	// The number of incoming bytes from other levels read during
 	// compactions. This excludes bytes moved and bytes ingested. For L0 this is
 	// the bytes written to the WAL.
@@ -94,10 +82,6 @@ type LevelMetrics struct {
 	TablesIngested uint64
 	// The number of sstables moved to this level by a "move" compaction.
 	TablesMoved uint64
-	// The number of sstables deleted in a level by a delete-only compaction.
-	TablesDeleted uint64
-	// The number of sstables excised in a level by a delete-only compaction.
-	TablesExcised uint64
 
 	MultiLevel struct {
 		// BytesInTop are the total bytes in a multilevel compaction coming from the top level.
@@ -157,10 +141,6 @@ func (m *LevelMetrics) WriteAmp() float64 {
 	return float64(m.BytesFlushed+m.BytesCompacted) / float64(m.BytesIn)
 }
 
-var categoryCompaction = block.RegisterCategory("pebble-compaction", block.NonLatencySensitiveQoSLevel)
-var categoryIngest = block.RegisterCategory("pebble-ingest", block.LatencySensitiveQoSLevel)
-var categoryGet = block.RegisterCategory("pebble-get", block.LatencySensitiveQoSLevel)
-
 // Metrics holds metrics for various subsystems of the DB such as the Cache,
 // Compactions, WAL, and per-Level metrics.
 //
@@ -172,17 +152,15 @@ type Metrics struct {
 
 	Compact struct {
 		// The total number of compactions, and per-compaction type counts.
-		Count                 int64
-		DefaultCount          int64
-		DeleteOnlyCount       int64
-		ElisionOnlyCount      int64
-		CopyCount             int64
-		MoveCount             int64
-		ReadCount             int64
-		TombstoneDensityCount int64
-		RewriteCount          int64
-		MultiLevelCount       int64
-		CounterLevelCount     int64
+		Count             int64
+		DefaultCount      int64
+		DeleteOnlyCount   int64
+		ElisionOnlyCount  int64
+		MoveCount         int64
+		ReadCount         int64
+		RewriteCount      int64
+		MultiLevelCount   int64
+		CounterLevelCount int64
 		// An estimate of the number of bytes that need to be compacted for the LSM
 		// to reach a stable state.
 		EstimatedDebt uint64
@@ -192,16 +170,6 @@ type Metrics struct {
 		InProgressBytes int64
 		// Number of compactions that are in-progress.
 		NumInProgress int64
-		// Number of compactions that were cancelled.
-		CancelledCount int64
-		// CancelledBytes the number of bytes written by compactions that were
-		// cancelled.
-		CancelledBytes int64
-		// Total number of compactions that hit an error.
-		FailedCount int64
-		// NumProblemSpans is the current (instantaneous) count of "problem spans"
-		// which temporarily block compactions.
-		NumProblemSpans int
 		// MarkedFiles is a count of files that are marked for
 		// compaction. Such files are compacted in a rewrite compaction
 		// when no other compactions are picked.
@@ -269,7 +237,7 @@ type Metrics struct {
 		// The number of currently open snapshots.
 		Count int
 		// The sequence number of the earliest, currently open snapshot.
-		EarliestSeqNum base.SeqNum
+		EarliestSeqNum uint64
 		// A running tally of keys written to sstables during flushes or
 		// compactions that would've been elided if it weren't for open
 		// snapshots.
@@ -291,43 +259,13 @@ type Metrics struct {
 		ZombieSize uint64
 		// The count of zombie tables.
 		ZombieCount int64
-		// The count of sstables backing virtual tables.
+		// The count of the backing sstables.
 		BackingTableCount uint64
-		// The sum of the sizes of the BackingTableCount sstables that are backing virtual tables.
+		// The sum of the sizes of the all of the backing sstables.
 		BackingTableSize uint64
-		// The number of sstables that are compressed with an unknown compression
-		// algorithm.
-		CompressedCountUnknown int64
-		// The number of sstables that are compressed with the default compression
-		// algorithm, snappy.
-		CompressedCountSnappy int64
-		// The number of sstables that are compressed with zstd.
-		CompressedCountZstd int64
-		// The number of sstables that are compressed with minlz.
-		CompressedCountMinLZ int64
-		// The number of sstables that are uncompressed.
-		CompressedCountNone int64
-
-		// Local file sizes.
-		Local struct {
-			// LiveSize is the number of bytes in live tables.
-			LiveSize uint64
-			// ObsoleteSize is the number of bytes in obsolete tables.
-			ObsoleteSize uint64
-			// ZombieSize is the number of bytes in zombie tables.
-			ZombieSize uint64
-		}
-
-		// Whether the initial stats collection (for existing tables on Open) is
-		// complete.
-		InitialStatsCollectionComplete bool
-		// The count of recently created sstables that need stats collection. This
-		// does not include sstables that existed when the DB was opened, so the
-		// value is only useful when InitialStatsCollectionComplete is true.
-		PendingStatsCollectionCount int64
 	}
 
-	FileCache CacheMetrics
+	TableCache CacheMetrics
 
 	// Count of the number of open sstable iterators.
 	TableIters int64
@@ -346,16 +284,11 @@ type Metrics struct {
 		Size uint64
 		// Physical size of the WAL files on-disk. With WAL file recycling,
 		// this is greater than the live data in WAL files.
-		//
-		// TODO(sumeer): it seems this does not include ObsoletePhysicalSize.
-		// Should the comment be updated?
 		PhysicalSize uint64
 		// Number of logical bytes written to the WAL.
 		BytesIn uint64
 		// Number of bytes written to the WAL.
 		BytesWritten uint64
-		// Failover contains failover stats. Empty if failover is not enabled.
-		Failover wal.FailoverStats
 	}
 
 	LogWriter struct {
@@ -363,16 +296,12 @@ type Metrics struct {
 		record.LogWriterMetrics
 	}
 
-	CategoryStats []block.CategoryStatsAggregate
-
 	SecondaryCacheMetrics SecondaryCacheMetrics
 
 	private struct {
 		optionsFileSize  uint64
 		manifestFileSize uint64
 	}
-
-	manualMemory manual.Metrics
 }
 
 var (
@@ -392,19 +321,18 @@ var (
 )
 
 // DiskSpaceUsage returns the total disk space used by the database in bytes,
-// including live and obsolete files. This only includes local files, i.e.,
-// remote files (as known to objstorage.Provider) are not included.
+// including live and obsolete files.
 func (m *Metrics) DiskSpaceUsage() uint64 {
 	var usageBytes uint64
 	usageBytes += m.WAL.PhysicalSize
 	usageBytes += m.WAL.ObsoletePhysicalSize
-	usageBytes += m.Table.Local.LiveSize
-	usageBytes += m.Table.Local.ObsoleteSize
-	usageBytes += m.Table.Local.ZombieSize
+	for _, lm := range m.Levels {
+		usageBytes += uint64(lm.Size)
+	}
+	usageBytes += m.Table.ObsoleteSize
+	usageBytes += m.Table.ZombieSize
 	usageBytes += m.private.optionsFileSize
 	usageBytes += m.private.manifestFileSize
-	// TODO(sumeer): InProgressBytes does not distinguish between local and
-	// remote files. This causes a small error. Fix.
 	usageBytes += uint64(m.Compact.InProgressBytes)
 	return usageBytes
 }
@@ -460,37 +388,32 @@ func (m *Metrics) Total() LevelMetrics {
 
 // String pretty-prints the metrics as below:
 //
-//	      |                             |                |       |   ingested   |     moved    |    written   |       |    amp   |     multilevel
-//	level | tables  size val-bl vtables | score  uc    c |   in  | tables  size | tables  size | tables  size |  read |   r   w  |    top   in  read
-//	------+-----------------------------+----------------+-------+--------------+--------------+--------------+-------+----------+------------------
-//	    0 |   101   102B     0B     101 | 1.10 2.10 0.30 |  104B |   112   104B |   113   106B |   221   217B |  107B |   1 2.09 |  104B  104B  104B
-//	    1 |   201   202B     0B     201 | 1.20 2.20 0.60 |  204B |   212   204B |   213   206B |   421   417B |  207B |   2 2.04 |  204B  204B  204B
-//	    2 |   301   302B     0B     301 | 1.30 2.30 0.90 |  304B |   312   304B |   313   306B |   621   617B |  307B |   3 2.03 |  304B  304B  304B
-//	    3 |   401   402B     0B     401 | 1.40 2.40 1.20 |  404B |   412   404B |   413   406B |   821   817B |  407B |   4 2.02 |  404B  404B  404B
-//	    4 |   501   502B     0B     501 | 1.50 2.50 1.50 |  504B |   512   504B |   513   506B |  1.0K  1017B |  507B |   5 2.02 |  504B  504B  504B
-//	    5 |   601   602B     0B     601 | 1.60 2.60 1.80 |  604B |   612   604B |   613   606B |  1.2K  1.2KB |  607B |   6 2.01 |  604B  604B  604B
-//	    6 |   701   702B     0B     701 |    - 2.70 2.10 |  704B |   712   704B |   713   706B |  1.4K  1.4KB |  707B |   7 2.01 |  704B  704B  704B
-//	total |  2.8K  2.7KB     0B    2.8K |    -    -    - | 2.8KB |  2.9K  2.8KB |  2.9K  2.8KB |  5.7K  8.4KB | 2.8KB |  28 3.00 | 2.8KB 2.8KB 2.8KB
-//	------------------------------------------------------------------------------------------------------------------------------------------------
+//	      |                             |       |       |   ingested   |     moved    |    written   |       |    amp
+//	level | tables  size val-bl vtables | score |   in  | tables  size | tables  size | tables  size |  read |   r   w
+//	------+-----------------------------+-------+-------+--------------+--------------+--------------+-------+---------
+//	    0 |   101   102B     0B       0 | 103.0 |  104B |   112   104B |   113   106B |   221   217B |  107B |   1  2.1
+//	    1 |   201   202B     0B       0 | 203.0 |  204B |   212   204B |   213   206B |   421   417B |  207B |   2  2.0
+//	    2 |   301   302B     0B       0 | 303.0 |  304B |   312   304B |   313   306B |   621   617B |  307B |   3  2.0
+//	    3 |   401   402B     0B       0 | 403.0 |  404B |   412   404B |   413   406B |   821   817B |  407B |   4  2.0
+//	    4 |   501   502B     0B       0 | 503.0 |  504B |   512   504B |   513   506B |  1.0K  1017B |  507B |   5  2.0
+//	    5 |   601   602B     0B       0 | 603.0 |  604B |   612   604B |   613   606B |  1.2K  1.2KB |  607B |   6  2.0
+//	    6 |   701   702B     0B       0 |     - |  704B |   712   704B |   713   706B |  1.4K  1.4KB |  707B |   7  2.0
+//	total |  2.8K  2.7KB     0B       0 |     - | 2.8KB |  2.9K  2.8KB |  2.9K  2.8KB |  5.7K  8.4KB | 2.8KB |  28  3.0
+//	-------------------------------------------------------------------------------------------------------------------
 //	WAL: 22 files (24B)  in: 25B  written: 26B (4% overhead)
 //	Flushes: 8
 //	Compactions: 5  estimated debt: 6B  in progress: 2 (7B)
-//	             default: 27  delete: 28  elision: 29  move: 30  read: 31  tombstone-density: 16  rewrite: 32  copy: 33  multi-level: 34
+//	default: 27  delete: 28  elision: 29  move: 30  read: 31  rewrite: 32  multi-level: 33
 //	MemTables: 12 (11B)  zombie: 14 (13B)
-//	Zombie tables: 16 (15B, local: 30B)
-//	Backing tables: 1 (2.0MB)
-//	Virtual tables: 2807 (2.8KB)
-//	Local tables size: 28B
-//	Compression types:
-//	Table stats: 31
+//	Zombie tables: 16 (15B)
+//	Backing tables: 0 (0B)
 //	Block cache: 2 entries (1B)  hit rate: 42.9%
 //	Table cache: 18 entries (17B)  hit rate: 48.7%
-//	Range key sets: 123  Tombstones: 456  Total missized tombstones encountered: 789
+//	Secondary cache: 40 entries (40B)  hit rate: 49.9%
 //	Snapshots: 4  earliest seq num: 1024
 //	Table iters: 21
 //	Filter utility: 47.4%
 //	Ingestions: 27  as flushable: 36 (34B in 35 tables)
-//	Cgo memory usage: 15KB  block cache: 9.0KB (data: 4.0KB, maps: 2.0KB, entries: 3.0KB)  memtables: 5.0KB
 func (m *Metrics) String() string {
 	return redact.StringWithoutMarkers(m)
 }
@@ -505,6 +428,12 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	// superfluous in the context of CockroachDB, which registers all the Go
 	// numeric types as safe.
 
+	// TODO(jackson): There are a few places where we use redact.SafeValue
+	// instead of redact.RedactableString. This is necessary because of a bug
+	// whereby formatting a redact.RedactableString argument does not respect
+	// width specifiers. When the issue is fixed, we can convert these to
+	// RedactableStrings. https://github.com/cockroachdb/redact/issues/17
+
 	multiExists := m.Compact.MultiLevelCount > 0
 	appendIfMulti := func(line redact.SafeString) {
 		if multiExists {
@@ -515,31 +444,43 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 		w.SafeString("\n")
 	}
 
-	w.SafeString("      |                             |                |       |   ingested   |     moved    |    written   |       |    amp")
+	w.SafeString("      |                             |       |       |   ingested   |     moved    |    written   |       |    amp")
 	appendIfMulti("   |     multilevel")
 	newline()
-	w.SafeString("level | tables  size val-bl vtables | score  uc    c |   in  | tables  size | tables  size | tables  size |  read |   r   w")
+	w.SafeString("level | tables  size val-bl vtables | score |   in  | tables  size | tables  size | tables  size |  read |   r   w")
 	appendIfMulti("  |    top   in  read")
 	newline()
-	w.SafeString("------+-----------------------------+----------------+-------+--------------+--------------+--------------+-------+---------")
+	w.SafeString("------+-----------------------------+-------+-------+--------------+--------------+--------------+-------+---------")
 	appendIfMulti("-+------------------")
 	newline()
 
 	// formatRow prints out a row of the table.
-	formatRow := func(m *LevelMetrics) {
-		score := m.Score
-		if score == 0 {
-			// Format a zero level score as a dash.
-			score = math.NaN()
+	formatRow := func(m *LevelMetrics, score float64) {
+		scoreStr := "-"
+		if !math.IsNaN(score) {
+			// Try to keep the string no longer than 5 characters.
+			switch {
+			case score < 99.995:
+				scoreStr = fmt.Sprintf("%.2f", score)
+			case score < 999.95:
+				scoreStr = fmt.Sprintf("%.1f", score)
+			default:
+				scoreStr = fmt.Sprintf("%.0f", score)
+			}
 		}
-		w.Printf("| %5s %6s %6s %7s | %4s %4s %4s | %5s | %5s %6s | %5s %6s | %5s %6s | %5s | %3d %4s",
+		var wampStr string
+		if wamp := m.WriteAmp(); wamp > 99.5 {
+			wampStr = fmt.Sprintf("%.0f", wamp)
+		} else {
+			wampStr = fmt.Sprintf("%.1f", wamp)
+		}
+
+		w.Printf("| %5s %6s %6s %7s | %5s | %5s | %5s %6s | %5s %6s | %5s %6s | %5s | %3d %4s",
 			humanize.Count.Int64(m.NumFiles),
 			humanize.Bytes.Int64(m.Size),
 			humanize.Bytes.Uint64(m.Additional.ValueBlocksSize),
 			humanize.Count.Uint64(m.NumVirtualFiles),
-			humanizeFloat(score, 4),
-			humanizeFloat(m.UncompensatedScore, 4),
-			humanizeFloat(m.CompensatedScore, 4),
+			redact.Safe(scoreStr),
 			humanize.Bytes.Uint64(m.BytesIn),
 			humanize.Count.Uint64(m.TablesIngested),
 			humanize.Bytes.Uint64(m.BytesIngested),
@@ -549,8 +490,7 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 			humanize.Bytes.Uint64(m.BytesFlushed+m.BytesCompacted),
 			humanize.Bytes.Uint64(m.BytesRead),
 			redact.Safe(m.Sublevels),
-			humanizeFloat(m.WriteAmp(), 4),
-		)
+			redact.Safe(wampStr))
 
 		if multiExists {
 			w.Printf(" | %5s %5s %5s",
@@ -565,7 +505,13 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	for level := 0; level < numLevels; level++ {
 		l := &m.Levels[level]
 		w.Printf("%5d ", redact.Safe(level))
-		formatRow(l)
+
+		// Format the score.
+		score := math.NaN()
+		if level < numLevels-1 {
+			score = l.Score
+		}
+		formatRow(l, score)
 		total.Add(l)
 		total.Sublevels += l.Sublevels
 	}
@@ -575,54 +521,35 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	// the bytes written to the log and bytes written externally and then
 	// ingested.
 	total.BytesFlushed += total.BytesIn
-	total.Score = math.NaN()
-	total.CompensatedScore = math.NaN()
-	total.UncompensatedScore = math.NaN()
 	w.SafeString("total ")
-	formatRow(&total)
+	formatRow(&total, math.NaN())
 
-	w.SafeString("----------------------------------------------------------------------------------------------------------------------------")
+	w.SafeString("-------------------------------------------------------------------------------------------------------------------")
 	appendIfMulti("--------------------")
 	newline()
-	w.Printf("WAL: %d files (%s)  in: %s  written: %s (%.0f%% overhead)",
+	w.Printf("WAL: %d files (%s)  in: %s  written: %s (%.0f%% overhead)\n",
 		redact.Safe(m.WAL.Files),
 		humanize.Bytes.Uint64(m.WAL.Size),
 		humanize.Bytes.Uint64(m.WAL.BytesIn),
 		humanize.Bytes.Uint64(m.WAL.BytesWritten),
 		redact.Safe(percent(int64(m.WAL.BytesWritten)-int64(m.WAL.BytesIn), int64(m.WAL.BytesIn))))
-	failoverStats := m.WAL.Failover
-	failoverStats.FailoverWriteAndSyncLatency = nil
-	if failoverStats == (wal.FailoverStats{}) {
-		w.Printf("\n")
-	} else {
-		w.Printf(" failover: (switches: %d, primary: %s, secondary: %s)\n", m.WAL.Failover.DirSwitchCount,
-			m.WAL.Failover.PrimaryWriteDuration.String(), m.WAL.Failover.SecondaryWriteDuration.String())
-	}
 
 	w.Printf("Flushes: %d\n", redact.Safe(m.Flush.Count))
 
-	w.Printf("Compactions: %d  estimated debt: %s  in progress: %d (%s)  canceled: %d (%s)  failed: %d  problem spans: %d\n",
+	w.Printf("Compactions: %d  estimated debt: %s  in progress: %d (%s)\n",
 		redact.Safe(m.Compact.Count),
 		humanize.Bytes.Uint64(m.Compact.EstimatedDebt),
 		redact.Safe(m.Compact.NumInProgress),
-		humanize.Bytes.Int64(m.Compact.InProgressBytes),
-		redact.Safe(m.Compact.CancelledCount),
-		humanize.Bytes.Int64(m.Compact.CancelledBytes),
-		redact.Safe(m.Compact.FailedCount),
-		redact.Safe(m.Compact.NumProblemSpans),
-	)
+		humanize.Bytes.Int64(m.Compact.InProgressBytes))
 
-	w.Printf("             default: %d  delete: %d  elision: %d  move: %d  read: %d  tombstone-density: %d  rewrite: %d  copy: %d  multi-level: %d\n",
+	w.Printf("             default: %d  delete: %d  elision: %d  move: %d  read: %d  rewrite: %d  multi-level: %d\n",
 		redact.Safe(m.Compact.DefaultCount),
 		redact.Safe(m.Compact.DeleteOnlyCount),
 		redact.Safe(m.Compact.ElisionOnlyCount),
 		redact.Safe(m.Compact.MoveCount),
 		redact.Safe(m.Compact.ReadCount),
-		redact.Safe(m.Compact.TombstoneDensityCount),
 		redact.Safe(m.Compact.RewriteCount),
-		redact.Safe(m.Compact.CopyCount),
-		redact.Safe(m.Compact.MultiLevelCount),
-	)
+		redact.Safe(m.Compact.MultiLevelCount))
 
 	w.Printf("MemTables: %d (%s)  zombie: %d (%s)\n",
 		redact.Safe(m.MemTable.Count),
@@ -630,10 +557,9 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 		redact.Safe(m.MemTable.ZombieCount),
 		humanize.Bytes.Uint64(m.MemTable.ZombieSize))
 
-	w.Printf("Zombie tables: %d (%s, local: %s)\n",
+	w.Printf("Zombie tables: %d (%s)\n",
 		redact.Safe(m.Table.ZombieCount),
-		humanize.Bytes.Uint64(m.Table.ZombieSize),
-		humanize.Bytes.Uint64(m.Table.Local.ZombieSize))
+		humanize.Bytes.Uint64(m.Table.ZombieSize))
 
 	w.Printf("Backing tables: %d (%s)\n",
 		redact.Safe(m.Table.BackingTableCount),
@@ -641,34 +567,6 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("Virtual tables: %d (%s)\n",
 		redact.Safe(m.NumVirtual()),
 		humanize.Bytes.Uint64(m.VirtualSize()))
-	w.Printf("Local tables size: %s\n", humanize.Bytes.Uint64(m.Table.Local.LiveSize))
-	w.SafeString("Compression types:")
-	if count := m.Table.CompressedCountSnappy; count > 0 {
-		w.Printf(" snappy: %d", redact.Safe(count))
-	}
-	if count := m.Table.CompressedCountZstd; count > 0 {
-		w.Printf(" zstd: %d", redact.Safe(count))
-	}
-	if count := m.Table.CompressedCountMinLZ; count > 0 {
-		w.Printf(" minlz: %d", redact.Safe(count))
-	}
-	if count := m.Table.CompressedCountNone; count > 0 {
-		w.Printf(" none: %d", redact.Safe(count))
-	}
-	if count := m.Table.CompressedCountUnknown; count > 0 {
-		w.Printf(" unknown: %d", redact.Safe(count))
-	}
-	w.Printf("\n")
-
-	w.Printf("Table stats: ")
-	if !m.Table.InitialStatsCollectionComplete {
-		w.Printf("initial load in progress")
-	} else if m.Table.PendingStatsCollectionCount == 0 {
-		w.Printf("all loaded")
-	} else {
-		w.Printf("%s", humanize.Count.Int64(m.Table.PendingStatsCollectionCount))
-	}
-	w.Printf("\n")
 
 	formatCacheMetrics := func(m *CacheMetrics, name redact.SafeString) {
 		w.Printf("%s: %s entries (%s)  hit rate: %.1f%%\n",
@@ -678,7 +576,7 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 			redact.Safe(hitRate(m.Hits, m.Misses)))
 	}
 	formatCacheMetrics(&m.BlockCache, "Block cache")
-	formatCacheMetrics(&m.FileCache, "Table cache")
+	formatCacheMetrics(&m.TableCache, "Table cache")
 
 	formatSharedCacheMetrics := func(w redact.SafePrinter, m *SecondaryCacheMetrics, name redact.SafeString) {
 		w.Printf("%s: %s entries (%s)  hit rate: %.1f%%\n",
@@ -687,15 +585,7 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 			humanize.Bytes.Int64(m.Size),
 			redact.Safe(hitRate(m.ReadsWithFullHit, m.ReadsWithPartialHit+m.ReadsWithNoHit)))
 	}
-	if m.SecondaryCacheMetrics.Size > 0 || m.SecondaryCacheMetrics.ReadsWithFullHit > 0 {
-		formatSharedCacheMetrics(w, &m.SecondaryCacheMetrics, "Secondary cache")
-	}
-
-	w.Printf("Range key sets: %s  Tombstones: %s  Total missized tombstones encountered: %s\n",
-		humanize.Count.Uint64(m.Keys.RangeKeySetsCount),
-		humanize.Count.Uint64(m.Keys.TombstoneCount),
-		humanize.Count.Uint64(m.Keys.MissizedTombstonesCount),
-	)
+	formatSharedCacheMetrics(w, &m.SecondaryCacheMetrics, "Secondary cache")
 
 	w.Printf("Snapshots: %d  earliest seq num: %d\n",
 		redact.Safe(m.Snapshots.Count),
@@ -708,22 +598,6 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 		redact.Safe(m.Flush.AsIngestCount),
 		humanize.Bytes.Uint64(m.Flush.AsIngestBytes),
 		redact.Safe(m.Flush.AsIngestTableCount))
-
-	var inUseTotal uint64
-	for i := range m.manualMemory {
-		inUseTotal += m.manualMemory[i].InUseBytes
-	}
-	inUse := func(purpose manual.Purpose) uint64 {
-		return m.manualMemory[purpose].InUseBytes
-	}
-	w.Printf("Cgo memory usage: %s  block cache: %s (data: %s, maps: %s, entries: %s)  memtables: %s\n",
-		humanize.Bytes.Uint64(inUseTotal),
-		humanize.Bytes.Uint64(inUse(manual.BlockCacheData)+inUse(manual.BlockCacheMap)+inUse(manual.BlockCacheEntry)),
-		humanize.Bytes.Uint64(inUse(manual.BlockCacheData)),
-		humanize.Bytes.Uint64(inUse(manual.BlockCacheMap)),
-		humanize.Bytes.Uint64(inUse(manual.BlockCacheEntry)),
-		humanize.Bytes.Uint64(inUse(manual.MemTable)),
-	)
 }
 
 func hitRate(hits, misses int64) float64 {
@@ -745,42 +619,7 @@ func (m *Metrics) StringForTests() string {
 		// This is the difference in Sizeof(sstable.Reader{})) between 64 and 32 bit
 		// platforms.
 		const tableCacheSizeAdjustment = 212
-		mCopy.FileCache.Size += mCopy.FileCache.Count * tableCacheSizeAdjustment
+		mCopy.TableCache.Size += mCopy.TableCache.Count * tableCacheSizeAdjustment
 	}
-	// Don't show cgo memory statistics as they can vary based on architecture,
-	// invariants tag, etc.
-	mCopy.manualMemory = manual.Metrics{}
 	return redact.StringWithoutMarkers(&mCopy)
-}
-
-// levelMetricsDelta accumulates incremental ("delta") level metric updates
-// (e.g. from compactions or flushes).
-type levelMetricsDelta [manifest.NumLevels]*LevelMetrics
-
-func (m *Metrics) updateLevelMetrics(updates levelMetricsDelta) {
-	for i, u := range updates {
-		if u != nil {
-			m.Levels[i].Add(u)
-		}
-	}
-}
-
-// humanizeFloat formats a float64 value as a string. It shows up to two
-// decimals, depending on the target length. NaN is shown as "-".
-func humanizeFloat(v float64, targetLength int) redact.SafeString {
-	if math.IsNaN(v) {
-		return "-"
-	}
-	// We treat 0 specially. Values near zero will show up as 0.00.
-	if v == 0 {
-		return "0"
-	}
-	res := fmt.Sprintf("%.2f", v)
-	if len(res) <= targetLength {
-		return redact.SafeString(res)
-	}
-	if len(res) == targetLength+1 {
-		return redact.SafeString(fmt.Sprintf("%.1f", v))
-	}
-	return redact.SafeString(fmt.Sprintf("%.0f", v))
 }

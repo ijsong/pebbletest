@@ -187,14 +187,14 @@ func (fs *enospcFS) handleENOSPC(gen uint32) {
 	}
 }
 
-func (fs *enospcFS) Create(name string, category DiskWriteCategory) (File, error) {
+func (fs *enospcFS) Create(name string) (File, error) {
 	gen := fs.waitUntilReady()
 
-	f, err := fs.inner.Create(name, category)
+	f, err := fs.inner.Create(name)
 
 	if err != nil && isENOSPC(err) {
 		fs.handleENOSPC(gen)
-		f, err = fs.inner.Create(name, category)
+		f, err = fs.inner.Create(name)
 	}
 	if f != nil {
 		f = &enospcFile{
@@ -228,10 +228,8 @@ func (fs *enospcFS) Open(name string, opts ...OpenOption) (File, error) {
 	return f, err
 }
 
-func (fs *enospcFS) OpenReadWrite(
-	name string, category DiskWriteCategory, opts ...OpenOption,
-) (File, error) {
-	f, err := fs.inner.OpenReadWrite(name, category, opts...)
+func (fs *enospcFS) OpenReadWrite(name string, opts ...OpenOption) (File, error) {
+	f, err := fs.inner.OpenReadWrite(name, opts...)
 	if f != nil {
 		f = &enospcFile{
 			fs:    fs,
@@ -288,16 +286,14 @@ func (fs *enospcFS) Rename(oldname, newname string) error {
 	return err
 }
 
-func (fs *enospcFS) ReuseForWrite(
-	oldname, newname string, category DiskWriteCategory,
-) (File, error) {
+func (fs *enospcFS) ReuseForWrite(oldname, newname string) (File, error) {
 	gen := fs.waitUntilReady()
 
-	f, err := fs.inner.ReuseForWrite(oldname, newname, category)
+	f, err := fs.inner.ReuseForWrite(oldname, newname)
 
 	if err != nil && isENOSPC(err) {
 		fs.handleENOSPC(gen)
-		f, err = fs.inner.ReuseForWrite(oldname, newname, category)
+		f, err = fs.inner.ReuseForWrite(oldname, newname)
 	}
 
 	if f != nil {
@@ -337,7 +333,7 @@ func (fs *enospcFS) List(dir string) ([]string, error) {
 	return fs.inner.List(dir)
 }
 
-func (fs *enospcFS) Stat(name string) (FileInfo, error) {
+func (fs *enospcFS) Stat(name string) (os.FileInfo, error) {
 	return fs.inner.Stat(name)
 }
 
@@ -412,7 +408,7 @@ func (f *enospcFile) Preallocate(offset, length int64) error {
 	return f.inner.Preallocate(offset, length)
 }
 
-func (f *enospcFile) Stat() (FileInfo, error) {
+func (f *enospcFile) Stat() (os.FileInfo, error) {
 	return f.inner.Stat()
 }
 

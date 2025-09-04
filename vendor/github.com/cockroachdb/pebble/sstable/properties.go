@@ -11,15 +11,13 @@ import (
 	"math"
 	"reflect"
 	"sort"
-	"strings"
 	"unsafe"
 
 	"github.com/cockroachdb/pebble/internal/intern"
-	"github.com/cockroachdb/pebble/internal/invariants"
-	"github.com/cockroachdb/pebble/sstable/rowblk"
 )
 
 const propertiesBlockRestartInterval = math.MaxInt32
+const propGlobalSeqnumName = "rocksdb.external_sst_file.global_seqno"
 
 var propTagMap = make(map[string]reflect.StructField)
 var propBoolTrue = []byte{'1'}
@@ -102,17 +100,6 @@ type CommonProperties struct {
 	NumRangeKeySets uint64 `prop:"pebble.num.range-key-sets"`
 	// Total size of value blocks and value index block. Only serialized if > 0.
 	ValueBlocksSize uint64 `prop:"pebble.value-blocks.size"`
-	// NumDataBlocks is the number of data blocks in this table.
-	NumDataBlocks uint64 `prop:"rocksdb.num.data.blocks"`
-	// NumTombstoneDenseBlocks is the number of data blocks in this table that
-	// are considered tombstone-dense. See the TombstoneDenseBlocksRatio field
-	// in manifest.TableStats for the criteria used to determine if a data
-	// block is tombstone-dense.
-	NumTombstoneDenseBlocks uint64 `prop:"pebble.num.tombstone-dense-blocks"`
-	// The compression algorithm used to compress blocks.
-	CompressionName string `prop:"rocksdb.compression"`
-	// The compression options used to compress blocks.
-	CompressionOptions string `prop:"rocksdb.compression_options"`
 }
 
 // String is only used for testing purposes.
@@ -127,7 +114,7 @@ func (c *CommonProperties) String() string {
 // NumPointDeletions is the number of point deletions in the sstable. For virtual
 // sstables, this is an estimate.
 func (c *CommonProperties) NumPointDeletions() uint64 {
-	return invariants.SafeSub(c.NumDeletions, c.NumRangeDeletions)
+	return c.NumDeletions - c.NumRangeDeletions
 }
 
 // Properties holds the sstable property values. The properties are
@@ -141,27 +128,37 @@ type Properties struct {
 
 	// The name of the comparer used in this table.
 	ComparerName string `prop:"rocksdb.comparator"`
+	// The compression algorithm used to compress blocks.
+	CompressionName string `prop:"rocksdb.compression"`
+	// The compression options used to compress blocks.
+	CompressionOptions string `prop:"rocksdb.compression_options"`
 	// The total size of all data blocks.
 	DataSize uint64 `prop:"rocksdb.data.size"`
+	// The external sstable version format. Version 2 is the one RocksDB has been
+	// using since 5.13. RocksDB only uses the global sequence number for an
+	// sstable if this property has been set.
+	ExternalFormatVersion uint32 `prop:"rocksdb.external_sst_file.version"`
 	// The name of the filter policy used in this table. Empty if no filter
 	// policy is used.
 	FilterPolicyName string `prop:"rocksdb.filter.policy"`
 	// The size of filter block.
 	FilterSize uint64 `prop:"rocksdb.filter.size"`
+	// The global sequence number to use for all entries in the table. Present if
+	// the table was created externally and ingested whole.
+	GlobalSeqNum uint64 `prop:"rocksdb.external_sst_file.global_seqno"`
 	// Total number of index partitions if kTwoLevelIndexSearch is used.
 	IndexPartitions uint64 `prop:"rocksdb.index.partitions"`
-	// The size (uncompressed) of index block.
+	// The size of index block.
 	IndexSize uint64 `prop:"rocksdb.index.size"`
 	// The index type. TODO(peter): add a more detailed description.
 	IndexType uint32 `prop:"rocksdb.block.based.table.index.type"`
 	// For formats >= TableFormatPebblev4, this is set to true if the obsolete
 	// bit is strict for all the point keys.
 	IsStrictObsolete bool `prop:"pebble.obsolete.is_strict"`
-	// The name of the key schema used in this table. Empty for formats <=
-	// TableFormatPebblev4.
-	KeySchemaName string `prop:"pebble.colblk.schema"`
 	// The name of the merger used in this table. Empty if no merger is used.
 	MergerName string `prop:"rocksdb.merge.operator"`
+	// The number of blocks in this table.
+	NumDataBlocks uint64 `prop:"rocksdb.num.data.blocks"`
 	// The number of merge operands in the table.
 	NumMergeOperands uint64 `prop:"rocksdb.merge.operands"`
 	// The number of RANGEKEYUNSETs in this table.
@@ -170,8 +167,11 @@ type Properties struct {
 	NumValueBlocks uint64 `prop:"pebble.num.value-blocks"`
 	// The number of values stored in value blocks. Only serialized if > 0.
 	NumValuesInValueBlocks uint64 `prop:"pebble.num.values.in.value-blocks"`
-	// The number of values stored in blob files. Only serialized if > 0.
-	NumValuesInBlobFiles uint64 `prop:"pebble.num.values.in.blob-files"`
+	// The name of the prefix extractor used in this table. Empty if no prefix
+	// extractor is used.
+	PrefixExtractorName string `prop:"rocksdb.prefix.extractor.name"`
+	// If filtering is enabled, was the filter created on the key prefix.
+	PrefixFiltering bool `prop:"rocksdb.block.based.table.prefix.filtering"`
 	// A comma separated list of names of the property collectors used in this
 	// table.
 	PropertyCollectorNames string `prop:"rocksdb.property.collectors"`
@@ -187,11 +187,12 @@ type Properties struct {
 	// The cumulative bytes of values in this table that were pinned by
 	// open snapshots. This value is comparable to RawValueSize.
 	SnapshotPinnedValueSize uint64 `prop:"pebble.raw.snapshot-pinned-values.size"`
-	// Size (uncompressed) of the top-level index if kTwoLevelIndexSearch is used.
+	// Size of the top-level index if kTwoLevelIndexSearch is used.
 	TopLevelIndexSize uint64 `prop:"rocksdb.top-level.index.size"`
-	// User collected properties. Currently, we only use them to store block
-	// properties aggregated at the table level.
+	// User collected properties.
 	UserProperties map[string]string
+	// If filtering is enabled, was the filter created on the whole key.
+	WholeKeyFiltering bool `prop:"rocksdb.block.based.table.whole.key.filtering"`
 
 	// Loaded set indicating which fields have been loaded from disk. Indexed by
 	// the field's byte offset within the struct
@@ -249,47 +250,6 @@ func writeProperties(loaded map[uintptr]struct{}, v reflect.Value, buf *bytes.Bu
 	}
 }
 
-func (p *Properties) GetScaledProperties(backingSize, size uint64) CommonProperties {
-	// Make sure the sizes are sane, just in case.
-	size = max(size, 1)
-	backingSize = max(backingSize, size)
-
-	scale := func(a uint64) uint64 {
-		return (a*size + backingSize - 1) / backingSize
-	}
-	// It's important that no non-zero fields (like NumDeletions, NumRangeKeySets)
-	// become zero (or vice-versa).
-	if invariants.Enabled && (scale(1) != 1 || scale(0) != 0) {
-		panic("bad scale()")
-	}
-
-	var props CommonProperties
-	props.RawKeySize = scale(p.RawKeySize)
-	props.RawValueSize = scale(p.RawValueSize)
-	props.NumEntries = scale(p.NumEntries)
-	props.NumDataBlocks = scale(p.NumDataBlocks)
-	props.NumTombstoneDenseBlocks = scale(p.NumTombstoneDenseBlocks)
-
-	props.NumRangeDeletions = scale(p.NumRangeDeletions)
-	props.NumSizedDeletions = scale(p.NumSizedDeletions)
-	// We cannot directly scale NumDeletions, because it is supposed to be the sum
-	// of various types of deletions. See #4670.
-	numOtherDeletions := scale(invariants.SafeSub(p.NumDeletions, p.NumRangeDeletions) + p.NumSizedDeletions)
-	props.NumDeletions = numOtherDeletions + props.NumRangeDeletions + props.NumSizedDeletions
-
-	props.NumRangeKeyDels = scale(p.NumRangeKeyDels)
-	props.NumRangeKeySets = scale(p.NumRangeKeySets)
-
-	props.ValueBlocksSize = scale(p.ValueBlocksSize)
-
-	props.RawPointTombstoneKeySize = scale(p.RawPointTombstoneKeySize)
-	props.RawPointTombstoneValueSize = scale(p.RawPointTombstoneValueSize)
-
-	props.CompressionName = p.CompressionName
-
-	return props
-}
-
 func (p *Properties) String() string {
 	var buf bytes.Buffer
 	v := reflect.ValueOf(*p)
@@ -302,19 +262,15 @@ func (p *Properties) String() string {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		// If there are characters outside of the printable ASCII range, print
-		// the value in hexadecimal.
-		if strings.IndexFunc(p.UserProperties[key], func(r rune) bool { return r < ' ' || r > '~' }) != -1 {
-			fmt.Fprintf(&buf, "%s: hex:%x\n", key, p.UserProperties[key])
-		} else {
-			fmt.Fprintf(&buf, "%s: %s\n", key, p.UserProperties[key])
-		}
+		fmt.Fprintf(&buf, "%s: %s\n", key, p.UserProperties[key])
 	}
 	return buf.String()
 }
 
-func (p *Properties) load(b []byte, deniedUserProperties map[string]struct{}) error {
-	i, err := rowblk.NewRawIter(bytes.Compare, b)
+func (p *Properties) load(
+	b block, blockOffset uint64, deniedUserProperties map[string]struct{},
+) error {
+	i, err := newRawBlockIter(bytes.Compare, b)
 	if err != nil {
 		return err
 	}
@@ -331,7 +287,12 @@ func (p *Properties) load(b []byte, deniedUserProperties map[string]struct{}) er
 			case reflect.Uint32:
 				field.SetUint(uint64(binary.LittleEndian.Uint32(i.Value())))
 			case reflect.Uint64:
-				n, _ := binary.Uvarint(i.Value())
+				var n uint64
+				if string(i.Key().UserKey) == propGlobalSeqnumName {
+					n = binary.LittleEndian.Uint64(i.Value())
+				} else {
+					n, _ = binary.Uvarint(i.Value())
+				}
 				field.SetUint(n)
 			case reflect.String:
 				field.SetString(intern.Bytes(i.Value()))
@@ -372,8 +333,6 @@ func (p *Properties) saveUint64(m map[string][]byte, offset uintptr, value uint6
 	m[propOffsetTagMap[offset]] = buf[:]
 }
 
-var _ = (*Properties).saveUint64
-
 func (p *Properties) saveUvarint(m map[string][]byte, offset uintptr, value uint64) {
 	var buf [10]byte
 	n := binary.PutUvarint(buf[:], value)
@@ -384,7 +343,7 @@ func (p *Properties) saveString(m map[string][]byte, offset uintptr, value strin
 	m[propOffsetTagMap[offset]] = []byte(value)
 }
 
-func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
+func (p *Properties) save(tblFormat TableFormat, w *rawBlockWriter) {
 	m := make(map[string][]byte)
 	for k, v := range p.UserProperties {
 		m[k] = []byte(v)
@@ -400,6 +359,10 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
 		p.saveString(m, unsafe.Offsetof(p.CompressionOptions), p.CompressionOptions)
 	}
 	p.saveUvarint(m, unsafe.Offsetof(p.DataSize), p.DataSize)
+	if p.ExternalFormatVersion != 0 {
+		p.saveUint32(m, unsafe.Offsetof(p.ExternalFormatVersion), p.ExternalFormatVersion)
+		p.saveUint64(m, unsafe.Offsetof(p.GlobalSeqNum), p.GlobalSeqNum)
+	}
 	if p.FilterPolicyName != "" {
 		p.saveString(m, unsafe.Offsetof(p.FilterPolicyName), p.FilterPolicyName)
 	}
@@ -412,9 +375,6 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
 	p.saveUint32(m, unsafe.Offsetof(p.IndexType), p.IndexType)
 	if p.IsStrictObsolete {
 		p.saveBool(m, unsafe.Offsetof(p.IsStrictObsolete), p.IsStrictObsolete)
-	}
-	if p.KeySchemaName != "" {
-		p.saveString(m, unsafe.Offsetof(p.KeySchemaName), p.KeySchemaName)
 	}
 	if p.MergerName != "" {
 		p.saveString(m, unsafe.Offsetof(p.MergerName), p.MergerName)
@@ -450,9 +410,10 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
 	if p.NumValuesInValueBlocks > 0 {
 		p.saveUvarint(m, unsafe.Offsetof(p.NumValuesInValueBlocks), p.NumValuesInValueBlocks)
 	}
-	if p.NumValuesInBlobFiles > 0 {
-		p.saveUvarint(m, unsafe.Offsetof(p.NumValuesInBlobFiles), p.NumValuesInBlobFiles)
+	if p.PrefixExtractorName != "" {
+		p.saveString(m, unsafe.Offsetof(p.PrefixExtractorName), p.PrefixExtractorName)
 	}
+	p.saveBool(m, unsafe.Offsetof(p.PrefixFiltering), p.PrefixFiltering)
 	if p.PropertyCollectorNames != "" {
 		p.saveString(m, unsafe.Offsetof(p.PropertyCollectorNames), p.PropertyCollectorNames)
 	}
@@ -466,18 +427,16 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
 	if p.ValueBlocksSize > 0 {
 		p.saveUvarint(m, unsafe.Offsetof(p.ValueBlocksSize), p.ValueBlocksSize)
 	}
-	if p.NumTombstoneDenseBlocks != 0 {
-		p.saveUvarint(m, unsafe.Offsetof(p.NumTombstoneDenseBlocks), p.NumTombstoneDenseBlocks)
-	}
+	p.saveBool(m, unsafe.Offsetof(p.WholeKeyFiltering), p.WholeKeyFiltering)
 
 	if tblFormat < TableFormatPebblev1 {
-		m["rocksdb.column.family.id"] = maxInt32Slice
-		m["rocksdb.fixed.key.length"] = singleZeroSlice
-		m["rocksdb.index.key.is.user.key"] = singleZeroSlice
-		m["rocksdb.index.value.is.delta.encoded"] = singleZeroSlice
-		m["rocksdb.oldest.key.time"] = singleZeroSlice
-		m["rocksdb.creation.time"] = singleZeroSlice
-		m["rocksdb.format.version"] = singleZeroSlice
+		m["rocksdb.column.family.id"] = binary.AppendUvarint([]byte(nil), math.MaxInt32)
+		m["rocksdb.fixed.key.length"] = []byte{0x00}
+		m["rocksdb.index.key.is.user.key"] = []byte{0x00}
+		m["rocksdb.index.value.is.delta.encoded"] = []byte{0x00}
+		m["rocksdb.oldest.key.time"] = []byte{0x00}
+		m["rocksdb.creation.time"] = []byte{0x00}
+		m["rocksdb.format.version"] = []byte{0x00}
 	}
 
 	keys := make([]string, 0, len(m))
@@ -486,14 +445,6 @@ func (p *Properties) save(tblFormat TableFormat, w *rowblk.Writer) error {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		if err := w.AddRawString(key, m[key]); err != nil {
-			return err
-		}
+		w.add(InternalKey{UserKey: []byte(key)}, m[key])
 	}
-	return nil
 }
-
-var (
-	singleZeroSlice = []byte{0x00}
-	maxInt32Slice   = binary.AppendUvarint([]byte(nil), math.MaxInt32)
-)

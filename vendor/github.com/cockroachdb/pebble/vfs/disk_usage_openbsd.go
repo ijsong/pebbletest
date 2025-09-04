@@ -3,6 +3,7 @@
 // the LICENSE file.
 
 //go:build openbsd
+// +build openbsd
 
 package vfs
 

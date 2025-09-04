@@ -19,17 +19,17 @@ func (h *mergingIterHeap) clear() {
 }
 
 func (h *mergingIterHeap) less(i, j int) bool {
-	ikv, jkv := h.items[i].iterKV, h.items[j].iterKV
-	if c := h.cmp(ikv.K.UserKey, jkv.K.UserKey); c != 0 {
+	ikey, jkey := h.items[i].iterKey, h.items[j].iterKey
+	if c := h.cmp(ikey.UserKey, jkey.UserKey); c != 0 {
 		if h.reverse {
 			return c > 0
 		}
 		return c < 0
 	}
 	if h.reverse {
-		return ikv.K.Trailer < jkv.K.Trailer
+		return ikey.Trailer < jkey.Trailer
 	}
-	return ikv.K.Trailer > jkv.K.Trailer
+	return ikey.Trailer > jkey.Trailer
 }
 
 func (h *mergingIterHeap) swap(i, j int) {
