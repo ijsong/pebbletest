@@ -17,7 +17,6 @@ type config struct {
 	valueSize            uint64
 	batchLength          int
 	testDuration         time.Duration
-	otelAddr             string
 	logger               *zap.Logger
 }
 
@@ -110,12 +109,6 @@ func WithBatchLength(length int) Option {
 func WithTestDuration(d time.Duration) Option {
 	return newFuncOption(func(c *config) {
 		c.testDuration = d
-	})
-}
-
-func WithOpenTelemetryCollector(addr string) Option {
-	return newFuncOption(func(c *config) {
-		c.otelAddr = addr
 	})
 }
 

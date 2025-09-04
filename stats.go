@@ -26,9 +26,12 @@ type stats struct {
 	batchCommitL0ReadAmpWriteStallDuration metric.Int64Counter
 	batchCommitWALRotationDuration         metric.Int64Counter
 	batchCommitCommitWaitDuration          metric.Int64Counter
+
+	compactionCount metric.Int64Counter
+	writeStallCount metric.Int64Counter
 }
 
-func newMetricProvider(addr string) (close func(), _ error) {
+func NewMetricProvider(addr string) (close func(), _ error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -114,6 +117,16 @@ func newStats() (s *stats, err error) {
 	}
 
 	s.batchCommitCommitWaitDuration, err = meter.Int64Counter("pebbletest.batch_commit.commit_wait_duration", metric.WithUnit("ns"))
+	if err != nil {
+		return nil, err
+	}
+
+	s.compactionCount, err = meter.Int64Counter("pebbletest.compaction.count", metric.WithUnit("{count}"))
+	if err != nil {
+		return nil, err
+	}
+
+	s.writeStallCount, err = meter.Int64Counter("pebbletest.write_stall.count", metric.WithUnit("{count}"))
 	if err != nil {
 		return nil, err
 	}

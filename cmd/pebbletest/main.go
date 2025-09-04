@@ -45,6 +45,12 @@ func main() {
 		_ = logger.Sync()
 	}()
 
+	stopMetricProvider, err := pebbletest.NewMetricProvider(viper.GetString("otel-addr"))
+	if err != nil {
+		logger.Fatal("failed to create metric provider", zap.Error(err))
+	}
+	defer stopMetricProvider()
+
 	buf, err := os.ReadFile(viper.GetString("pebble-options"))
 	if err != nil {
 		logger.Fatal("failed to read pebble options", zap.Error(err))
@@ -64,7 +70,6 @@ func main() {
 		pebbletest.WithValueSize(valueSize),
 		pebbletest.WithBatchLength(viper.GetInt("batch-length")),
 		pebbletest.WithTestDuration(viper.GetDuration("test-duration")),
-		pebbletest.WithOpenTelemetryCollector(viper.GetString("otel-addr")),
 		pebbletest.WithLogger(logger),
 	)
 	if err != nil {
