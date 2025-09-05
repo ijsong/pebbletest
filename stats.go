@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -31,7 +32,7 @@ type stats struct {
 	writeStallCount metric.Int64Counter
 }
 
-func NewMetricProvider(addr string) (close func(), _ error) {
+func NewMetricProvider(addr, testID string) (close func(), _ error) {
 	if addr == "" {
 		return func() {}, nil
 	}
@@ -44,6 +45,7 @@ func NewMetricProvider(addr string) (close func(), _ error) {
 	res, err := resource.New(context.Background(),
 		resource.WithAttributes(
 			semconv.ServiceNameKey.String("pebbletest"),
+			attribute.String("test-id", testID),
 		),
 	)
 	if err != nil {
