@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"math/rand/v2"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,15 +94,28 @@ func New(opts ...Option) (*PebbleTest, error) {
 }
 
 func (pt *PebbleTest) Start() error {
+	lis, err := net.Listen("tcp", pt.pprofAddr)
+	if err != nil {
+		return err
+	}
+
 	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = http.Serve(lis, nil)
+	}()
+
 	stopc := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		pt.startMetricsLogger(pt.db, stopc)
 	}()
+
 	defer func() {
 		close(stopc)
+		_ = lis.Close()
 		wg.Wait()
 	}()
 

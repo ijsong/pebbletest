@@ -26,6 +26,7 @@ func init() {
 	_ = pflag.Int("batch-length", 1, "Batch length")
 	_ = pflag.Duration("test-duration", 0, "Test duration")
 	_ = pflag.String("otel-addr", "", "OpenTelemetry collector address (e.g. localhost:4317)")
+	_ = pflag.String("pprof-addr", "", "Pprof listen address (e.g. localhost:6060)")
 	pflag.Parse()
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -71,6 +72,7 @@ func main() {
 		pebbletest.WithBatchLength(viper.GetInt("batch-length")),
 		pebbletest.WithTestDuration(viper.GetDuration("test-duration")),
 		pebbletest.WithLogger(logger),
+		pebbletest.WithPprofAddr(viper.GetString("pprof-addr")),
 	)
 	if err != nil {
 		logger.Fatal("failed to create pebble test", zap.Error(err))
