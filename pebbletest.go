@@ -94,6 +94,8 @@ func New(opts ...Option) (*PebbleTest, error) {
 		pt.stats.writeStallCount.Add(context.Background(), 1)
 	}
 
+	pebbleOpts.ErrorIfExists = true
+
 	db, err := pebble.Open(pt.dbDir, pebbleOpts)
 	if err != nil {
 		return nil, err
