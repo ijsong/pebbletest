@@ -27,6 +27,7 @@ func init() {
 	_ = pflag.Duration("test-duration", 0, "Test duration")
 	_ = pflag.String("otel-addr", "", "OpenTelemetry collector address (e.g. localhost:4317)")
 	_ = pflag.String("pprof-addr", "", "Pprof listen address (e.g. localhost:6060)")
+	_ = pflag.String("test-id", "", "Metric label to identify different test instances")
 	pflag.Parse()
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -46,7 +47,7 @@ func main() {
 		_ = logger.Sync()
 	}()
 
-	stopMetricProvider, err := pebbletest.NewMetricProvider(viper.GetString("otel-addr"))
+	stopMetricProvider, err := pebbletest.NewMetricProvider(viper.GetString("otel-addr"), viper.GetString("test-id"))
 	if err != nil {
 		logger.Fatal("failed to create metric provider", zap.Error(err))
 	}
