@@ -19,8 +19,9 @@ import (
 type PebbleTest struct {
 	config
 
-	db      *pebble.DB
-	running atomic.Bool
+	db       *pebble.DB
+	running  atomic.Bool
+	valueSet [][]byte
 
 	stats *stats
 }
@@ -33,6 +34,16 @@ func New(opts ...Option) (*PebbleTest, error) {
 
 	pt := &PebbleTest{
 		config: c,
+	}
+
+	rng := rand.NewChaCha8([32]byte{
+		0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
+		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+	})
+	pt.valueSet = make([][]byte, pt.batchLength*10)
+	for i := range pt.valueSet {
+		pt.valueSet[i] = make([]byte, pt.valueSize)
+		_, _ = rng.Read(pt.valueSet[i])
 	}
 
 	pt.stats, err = newStats()
@@ -135,13 +146,7 @@ func (pt *PebbleTest) start() error {
 		writeOpts = pebble.Sync
 	}
 
-	rng := rand.NewChaCha8([32]byte{
-		0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
-		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-	})
-
 	key := make([]byte, 8)
-	value := make([]byte, pt.valueSize)
 
 	var seqNum uint64
 	startTime := time.Now()
@@ -151,7 +156,7 @@ func (pt *PebbleTest) start() error {
 		for range pt.batchLength {
 			seqNum++
 			binary.BigEndian.PutUint64(key, seqNum)
-			_, _ = rng.Read(value)
+			value := pt.valueSet[seqNum%uint64(len(pt.valueSet))]
 			if err := batch.Set(key, value, writeOpts); err != nil {
 				return err
 			}
