@@ -2,9 +2,9 @@ package pebbletest
 
 import (
 	"context"
-	"fmt"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/runtime"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -43,25 +43,60 @@ func NewMetricProvider(addr, testID string) (close func(), _ error) {
 	}
 
 	res, err := resource.New(context.Background(),
+		resource.WithFromEnv(),
+		resource.WithHost(),
+		resource.WithTelemetrySDK(),
 		resource.WithAttributes(
-			semconv.ServiceNameKey.String("pebbletest"),
+			semconv.ServiceName("pebbletest"),
 			attribute.String("test-id", testID),
 		),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create resource: %w", err)
+		return nil, err
 	}
 
 	metricExporter, err := otlpmetricgrpc.New(context.Background(), otlpmetricgrpc.WithGRPCConn(conn))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create metrics exporter: %w", err)
+		return nil, err
 	}
 
-	meterProvider := sdkmetric.NewMeterProvider(
+	mpOpts := []sdkmetric.Option{
 		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter)),
 		sdkmetric.WithResource(res),
+	}
+	var boundaries []float64
+	// 50us, 100us, 150us, ..., 1ms
+	for dur := 50 * time.Microsecond; dur <= time.Millisecond; dur += 50 * time.Microsecond {
+		boundaries = append(boundaries, float64(dur))
+	}
+	// 5ms, 10ms, 15ms, 20ms, 25ms, 30ms, ..., 95ms
+	for dur := 5 * time.Millisecond; dur < 100*time.Millisecond; dur += 5 * time.Millisecond {
+		boundaries = append(boundaries, float64(dur))
+	}
+	// 100ms, 200ms, 300ms, ..., 1000ms
+	for dur := 100 * time.Millisecond; dur <= 1000*time.Millisecond; dur += 100 * time.Millisecond {
+		boundaries = append(boundaries, float64(dur))
+	}
+	mpOpts = append(mpOpts,
+		sdkmetric.WithView(sdkmetric.NewView(
+			sdkmetric.Instrument{
+				Name: "process.runtime.go.gc.pause_ns",
+			},
+			sdkmetric.Stream{
+				Aggregation: sdkmetric.AggregationExplicitBucketHistogram{
+					Boundaries: boundaries,
+				},
+			},
+		)),
 	)
+
+	meterProvider := sdkmetric.NewMeterProvider(mpOpts...)
 	otel.SetMeterProvider(meterProvider)
+
+	err = runtime.Start()
+	if err != nil {
+		return nil, err
+	}
 
 	closer := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
