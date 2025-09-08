@@ -28,6 +28,7 @@ func init() {
 	_ = pflag.String("otel-addr", "", "OpenTelemetry collector address (e.g. localhost:4317)")
 	_ = pflag.String("pprof-addr", "", "Pprof listen address (e.g. localhost:6060)")
 	_ = pflag.String("test-id", "", "Metric label to identify different test instances")
+	_ = pflag.String("ballast-size", "1GiB", "Size of ballast to allocate")
 	pflag.Parse()
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -45,6 +46,15 @@ func main() {
 	}
 	defer func() {
 		_ = logger.Sync()
+	}()
+
+	ballastSize, err := humanize.ParseBytes(viper.GetString("ballast-size"))
+	if err != nil {
+		logger.Fatal("failed to parse value size", zap.Error(err))
+	}
+	ballast := make([]byte, ballastSize)
+	defer func() {
+		_ = ballast
 	}()
 
 	stopMetricProvider, err := pebbletest.NewMetricProvider(viper.GetString("otel-addr"), viper.GetString("test-id"))
